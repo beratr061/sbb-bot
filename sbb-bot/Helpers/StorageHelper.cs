@@ -4,7 +4,8 @@ namespace SbbBot.Helpers;
 
 public static class StorageHelper
 {
-    private static readonly string DataPath = Path.Combine(AppContext.BaseDirectory, "Data");
+    private static readonly string DataPath = Environment.GetEnvironmentVariable("STORAGE_PATH") 
+                                              ?? Path.Combine(AppContext.BaseDirectory, "Data");
     private static readonly string SchedulePath = Path.Combine(DataPath, "schedules");
 
     static StorageHelper()
