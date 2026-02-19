@@ -1,5 +1,5 @@
 # Base image for build
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0-preview AS build
 WORKDIR /src
 
 # Copy the project file and restore dependencies
@@ -14,7 +14,7 @@ WORKDIR "/src/sbb-bot"
 RUN dotnet publish -c Release -o /app/publish
 
 # Runtime image
-FROM mcr.microsoft.com/dotnet/runtime:8.0
+FROM mcr.microsoft.com/dotnet/runtime:10.0-preview
 WORKDIR /app
 COPY --from=build /app/publish .
 
