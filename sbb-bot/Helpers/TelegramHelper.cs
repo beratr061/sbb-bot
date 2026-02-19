@@ -20,7 +20,15 @@ public class TelegramHelper
         _logger = logger;
         var token = config.Value.Telegram.Token;
         _chatId = config.Value.Telegram.ChatId;
-        _botClient = new TelegramBotClient(token);
+        try
+        {
+            _botClient = new TelegramBotClient(token);
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogError(ex, $"Invalid Telegram Bot Token provided: '{token}'. Please check appsettings.Development.json.");
+            throw; 
+        }
 
         // Polly retry policy: 3 retries with 2 seconds wait
         _retryPolicy = Policy

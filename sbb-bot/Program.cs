@@ -6,7 +6,6 @@ using Serilog;
 var builder = Host.CreateApplicationBuilder(args);
 
 // Configuration
-builder.Configuration.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
 builder.Services.Configure<BotConfig>(builder.Configuration);
 
 // Serilog Configuration

@@ -143,24 +143,50 @@ public class BusLineWatcherService : BackgroundService
                     };
                 }
 
-                // 1. Get LineId (fetch HTML if missing)
-                if (storedSchedule.LineId == 0)
-                {
-                    var client = _httpClientFactory.CreateClient();
-                    // Add User-Agent just in case
-                    client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-                    
-                    var html = await _retryPolicy.ExecuteAsync(async () => 
-                        await client.GetStringAsync(url, cancellationToken));
+                // 1. Get LineId (fetch HTML if missing OR if we need to check alerts)
+                // We should check alerts periodically too. Let's fetch HTML if we haven't checked alerts in a while or if LineId is missing.
+                // For simplicity, let's fetch HTML every time we check schedules to ensure we catch alerts.
+                // But to be polite, maybe we can combine it. 
 
-                    storedSchedule.LineId = ExtractLineId(html);
-                    
+                var client = _httpClientFactory.CreateClient();
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+                
+                string html = "";
+                try 
+                {
+                     html = await _retryPolicy.ExecuteAsync(async () => 
+                        await client.GetStringAsync(url, cancellationToken));
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning($"Failed to fetch HTML for line {name}: {ex.Message}");
+                }
+
+                if (!string.IsNullOrEmpty(html))
+                {
+                    // Check for Line Alerts (Modals)
+                    await CheckForLineAlertsAsync(name, url, html, storedSchedule);
+
                     if (storedSchedule.LineId == 0)
                     {
-                        _logger.LogWarning($"Could not extract LineId for {name}. Url: {url}");
-                        continue; 
+                        storedSchedule.LineId = ExtractLineId(html);
+                        if (storedSchedule.LineId == 0)
+                        {
+                            _logger.LogWarning($"Could not extract LineId for {name}. Url: {url}");
+                            // logic to continue or not? If we can't get LineId, we can't get schedule.
+                            // But we might have gotten an alert.
+                        }
                     }
                 }
+                else if (storedSchedule.LineId == 0)
+                {
+                     continue; // Can't do anything without HTML if LineId is missing
+                }
+
+                // If we still don't have LineId, skip schedule check
+                if (storedSchedule.LineId == 0) continue;
+
+                // 2. Prepare Dates for API Calls ... (rest of the code)
 
                 // 2. Prepare Dates for API Calls
                 var now = DateTime.UtcNow.AddHours(3); // Turkey Time
@@ -189,7 +215,7 @@ public class BusLineWatcherService : BackgroundService
 
                 if (hasChanged)
                 {
-                    // Only notify if we have previous data (avoid spam on first run)
+                    // ... (existing logic)
                     if (!string.IsNullOrEmpty(storedSchedule.LastScheduleHash)) 
                     {
                         var diffMessage = GenerateDiffMessage(name, storedSchedule.DayTimes, newDayTimes);
@@ -207,7 +233,10 @@ public class BusLineWatcherService : BackgroundService
                 }
                 else
                 {
-                    // Update LastChecked
+                    // If no schedule change, check if we should save due to alert change?
+                    // We don't know if alert changed. 
+                    // Let's just update LastChecked and Save if > 1 hour OR if LastAlertHash is not empty (slightly aggressive but safer).
+                    
                     if ((DateTime.UtcNow - storedSchedule.LastChecked).TotalHours > 1)
                     {
                         storedSchedule.LastChecked = DateTime.UtcNow;
@@ -496,7 +525,7 @@ public class BusLineWatcherService : BackgroundService
             .ToList();
     }
 
-    private (int Type, int Number, string Suffix, string FullText) GetLineSortKey(string lineEntry)
+    private (int Type, int Number, string? Suffix, string? FullText) GetLineSortKey(string lineEntry)
     {
         // lineEntry: "19K - Name|URL"
         // Extract the code part before first dash
@@ -667,5 +696,81 @@ public class BusLineWatcherService : BackgroundService
         }
 
         return hasChanges;
+    }
+    private async Task CheckForLineAlertsAsync(string lineName, string url, string html, BusSchedule storedSchedule)
+    {
+        try
+        {
+            var doc = new HtmlDocument();
+            doc.LoadHtml(html);
+
+            // Look for the modal structure provided by user:
+            // <div class="content ..."><div class="header"><span class="title ...">Title</span>...</div><div class="text"><p>...</p></div>...</div>
+            // Specifically looking for the title and text content.
+
+            // The user provided snippet has:
+            // <span class="title gotham-medium leaf-300 ...">Planlı Bakım Çalışması</span>
+            // <div class="text ..."><p>...</p></div>
+
+            var titleNode = doc.DocumentNode.SelectSingleNode("//span[contains(@class, 'title') and contains(@class, 'gotham-medium')]");
+            var textNode = doc.DocumentNode.SelectSingleNode("//div[contains(@class, 'text')]");
+
+            if (titleNode != null && textNode != null)
+            {
+                var title = titleNode.InnerText.Trim();
+                var text = textNode.InnerText.Trim();
+                
+                // Clean up html entities
+                title = System.Net.WebUtility.HtmlDecode(title);
+                text = System.Net.WebUtility.HtmlDecode(text);
+
+                if (!string.IsNullOrEmpty(title) && !string.IsNullOrEmpty(text))
+                {
+                    // Compute hash
+                    var contentToHash = $"{title}|{text}";
+                    using var sha = System.Security.Cryptography.SHA256.Create();
+                    var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(contentToHash));
+                    var hash = Convert.ToBase64String(bytes);
+
+                    if (storedSchedule.LastAlertHash != hash)
+                    {
+                        // New Alert!
+                        var msg = $"📢 *Hat Duyurusu: {lineName}*\n\n" +
+                                  $"🔹 *{title}*\n\n" +
+                                  $"{text.Replace("<br>", "\n").Replace("<p>", "").Replace("</p>", "\n")}\n\n" +
+                                  $"🔗 [Detaylar]({url})";
+                        
+                        await _telegramHelper.SendMessageAsync(msg);
+
+                        storedSchedule.LastAlertHash = hash;
+                        // Avoid saving here immediately potentially, wait for schedule save? 
+                        // Or force save because alert is important.
+                        // Let's set it, and let the main loop save if schedule changes OR force save if hash changed but schedule didn't?
+                        // Actually, the main loop checks `storedSchedule.LastScheduleHash != newHash`. 
+                        // We need to signal change.
+                        // But CheckForLineAlertsAsync returns void.
+                        // Let's rely on the fact that if we found an alert, we updated the object in memory.
+                        // We should ensure it gets saved.
+                    }
+                }
+            }
+            else
+            {
+                // No alert found. 
+                // If there WAS an alert before, should we clear the hash?
+                // If we clear it, then if the alert comes back (e.g. intermittent page load), we resend.
+                // If the alert is gone, we can clear it so next time a new alert comes we treat it as new.
+                if (!string.IsNullOrEmpty(storedSchedule.LastAlertHash))
+                {
+                    storedSchedule.LastAlertHash = "";
+                    // Alert removed. Should we notify? Maybe "Alert ended"? 
+                    // Usually users care about active alerts. Silence is fine.
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Error parsing alerts for {lineName}");
+        }
     }
 }

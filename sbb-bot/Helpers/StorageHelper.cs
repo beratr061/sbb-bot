@@ -209,6 +209,7 @@ public class BusSchedule
     public string LineName { get; set; } = "";
     public string Url { get; set; } = "";
     public string LastScheduleHash { get; set; } = "";
+    public string LastAlertHash { get; set; } = "";
     public Dictionary<string, List<string>> DayTimes { get; set; } = new(); 
     public DateTime LastChecked { get; set; }
 }
