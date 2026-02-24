@@ -63,6 +63,14 @@ public class MeetingWatcherService : BackgroundService
 
     private async Task CheckForMeetingAsync(CancellationToken cancellationToken)
     {
+        int intervalMinutes = _config.Intervals.MeetingMinutes > 0 ? _config.Intervals.MeetingMinutes : 1440;
+        var ageMinutes = StorageHelper.GetDataFileAgeMinutes("meetings.json");
+        if (ageMinutes < intervalMinutes)
+        {
+            _logger.LogInformation("Meeting data is fresh ({0:F0}m old), skipping check.", ageMinutes);
+            return;
+        }
+
         var client = _httpClientFactory.CreateClient();
         string html = await _retryPolicy.ExecuteAsync(async () =>
             await client.GetStringAsync(MeetingUrl, cancellationToken));
@@ -155,6 +163,9 @@ public class MeetingWatcherService : BackgroundService
             
             await StorageHelper.SaveMeetingsAsync(storedMeetings);
         }
+
+        // Mark as checked (touch file even if no new data)
+        StorageHelper.TouchDataFile("meetings.json");
     }
 
     private async Task SendMeetingNotificationAsync(string title)

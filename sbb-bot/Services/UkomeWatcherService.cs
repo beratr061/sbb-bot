@@ -64,6 +64,14 @@ public class UkomeWatcherService : BackgroundService
 
     private async Task CheckForUkomeDecisionsAsync(CancellationToken cancellationToken)
     {
+        int intervalMinutes = _config.Intervals.UkomeMinutes > 0 ? _config.Intervals.UkomeMinutes : 1440;
+        var ageMinutes = StorageHelper.GetDataFileAgeMinutes("ukome.json");
+        if (ageMinutes < intervalMinutes)
+        {
+            _logger.LogInformation("UKOME data is fresh ({0:F0}m old), skipping check.", ageMinutes);
+            return;
+        }
+
         var client = _httpClientFactory.CreateClient();
         
         // 1. Fetch Main Page to find ALL Year links
@@ -242,5 +250,8 @@ public class UkomeWatcherService : BackgroundService
                  await _telegramHelper.SendMessageAsync($"🚦 *UKOME Kararları Arşivi Güncellendi*\n\nToplam {newDecisions.Count} adet karar veritabanına eklendi. Yeni yıllar ve kararlar eklendikçe bildirim gelecektir.");
              }
         }
+
+        // Mark as checked (touch file even if no new data)
+        StorageHelper.TouchDataFile("ukome.json");
     }
 }

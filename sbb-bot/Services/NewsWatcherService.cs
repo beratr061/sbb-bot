@@ -63,6 +63,14 @@ public class NewsWatcherService : BackgroundService
 
     private async Task CheckForNewsAsync(CancellationToken cancellationToken)
     {
+        int intervalMinutes = _config.Intervals.NewsMinutes > 0 ? _config.Intervals.NewsMinutes : 60;
+        var ageMinutes = StorageHelper.GetDataFileAgeMinutes("news.json");
+        if (ageMinutes < intervalMinutes)
+        {
+            _logger.LogInformation("News data is fresh ({0:F0}m old), skipping check.", ageMinutes);
+            return;
+        }
+
         var newsList = await FetchLatestNewsAsync(cancellationToken);
         if (newsList == null || newsList.Count == 0) return;
 
@@ -106,6 +114,9 @@ public class NewsWatcherService : BackgroundService
                  _logger.LogInformation($"Initial news fetch complete. found {newNewsItems.Count} relevant news items.");
              }
         }
+
+        // Mark as checked (touch file even if no new data)
+        StorageHelper.TouchDataFile("news.json");
     }
 
     private async Task<List<string>> FetchLatestNewsAsync(CancellationToken cancellationToken)

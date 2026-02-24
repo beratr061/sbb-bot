@@ -10,25 +10,16 @@ namespace SbbBot.Helpers;
 
 public class TelegramHelper
 {
-    private readonly TelegramBotClient _botClient;
+    private readonly ITelegramBotClient _botClient;
     private readonly string _chatId;
     private readonly AsyncRetryPolicy _retryPolicy;
     private readonly ILogger<TelegramHelper> _logger;
 
-    public TelegramHelper(IOptions<BotConfig> config, ILogger<TelegramHelper> logger)
+    public TelegramHelper(ITelegramBotClient botClient, IOptions<BotConfig> config, ILogger<TelegramHelper> logger)
     {
+        _botClient = botClient;
         _logger = logger;
-        var token = config.Value.Telegram.Token;
         _chatId = config.Value.Telegram.ChatId;
-        try
-        {
-            _botClient = new TelegramBotClient(token);
-        }
-        catch (ArgumentException ex)
-        {
-            _logger.LogError(ex, $"Invalid Telegram Bot Token provided: '{token}'. Please check appsettings.Development.json.");
-            throw; 
-        }
 
         // Polly retry policy: 3 retries with 2 seconds wait
         _retryPolicy = Policy

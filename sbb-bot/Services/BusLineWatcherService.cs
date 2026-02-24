@@ -21,10 +21,11 @@ public class BusLineWatcherService : BackgroundService
     private readonly BotConfig _config;
     private readonly AsyncRetryPolicy _retryPolicy;
 
-    private const string OzelHalkUrl = "https://ulasim.sakarya.bel.tr/ulasim/ozel-halk";
-    private const string BelediyeUrl = "https://ulasim.sakarya.bel.tr/ulasim/belediye";
-    private const string MetrobusUrl = "https://ulasim.sakarya.bel.tr/ulasim/metrobus";
-    private const string AdarayUrl = "https://ulasim.sakarya.bel.tr/ulasim/adaray";
+    private const string ApiUrl = "https://sbbpublicapi.sakarya.bel.tr/api/v1/Ulasim?busType={0}";
+    private const int BusTypeBelediye = 3869;
+    private const int BusTypeOzelHalk = 5731;
+    private const int BusTypeTaksiDolmus = 5733;
+    private const int BusTypeMinibus = 5732;
 
     public BusLineWatcherService(
         ILogger<BusLineWatcherService> logger,
@@ -69,23 +70,31 @@ public class BusLineWatcherService : BackgroundService
 
     private async Task CheckBusLinesAsync(CancellationToken cancellationToken)
     {
-        var fetchedOzelHalk = await FetchLinesAsync(OzelHalkUrl, cancellationToken);
-        var fetchedBelediye = await FetchLinesAsync(BelediyeUrl, cancellationToken);
-        var fetchedMetrobus = await FetchLinesAsync(MetrobusUrl, cancellationToken);
-        var fetchedAdaray = await FetchLinesAsync(AdarayUrl, cancellationToken);
+        // Skip if data was fetched recently
+        var ageHours = StorageHelper.GetDataFileAgeHours("bus_lines.json");
+        if (ageHours < _config.Intervals.BusLinesHours)
+        {
+            _logger.LogInformation("Bus lines data is fresh ({0:F1}h old), skipping check.", ageHours);
+            return;
+        }
 
-        // Merge Metrobus and Adaray into "Belediye" list for notification/storage purposes
-        // Or keep them separate if needed. For now, merging into Belediye to keep storage simple.
-        fetchedBelediye.AddRange(fetchedMetrobus);
-        fetchedBelediye.AddRange(fetchedAdaray);
+        var fetchedOzelHalk = await FetchLinesFromApiAsync(BusTypeOzelHalk, cancellationToken);
+        var fetchedBelediye = await FetchLinesFromApiAsync(BusTypeBelediye, cancellationToken);
+        var fetchedTaksiDolmus = await FetchLinesFromApiAsync(BusTypeTaksiDolmus, cancellationToken);
+        var fetchedMinibus = await FetchLinesFromApiAsync(BusTypeMinibus, cancellationToken);
 
-        // Dedup just in case
+        // Sort both lists
+        fetchedOzelHalk = fetchedOzelHalk.Distinct().OrderBy(GetLineSortKey).ToList();
         fetchedBelediye = fetchedBelediye.Distinct().OrderBy(GetLineSortKey).ToList();
+        fetchedTaksiDolmus = fetchedTaksiDolmus.Distinct().OrderBy(GetLineSortKey).ToList();
+        fetchedMinibus = fetchedMinibus.Distinct().OrderBy(GetLineSortKey).ToList();
 
         var currentData = new BusLinesData
         {
             ozel_halk = fetchedOzelHalk,
-            belediye = fetchedBelediye
+            belediye = fetchedBelediye,
+            taksi_dolmus = fetchedTaksiDolmus,
+            minibus = fetchedMinibus
         };
 
         var storedData = await StorageHelper.ReadBusLinesAsync();
@@ -103,6 +112,18 @@ public class BusLineWatcherService : BackgroundService
             changesDetected = true;
         }
 
+        // Compare Taksi-Dolmuş
+        if (await ProcessLineChangesAsync(storedData.taksi_dolmus, currentData.taksi_dolmus, "Taksi-Dolmuş"))
+        {
+            changesDetected = true;
+        }
+
+        // Compare Minibüs
+        if (await ProcessLineChangesAsync(storedData.minibus, currentData.minibus, "Minibüs"))
+        {
+            changesDetected = true;
+        }
+
         if (changesDetected)
         {
             await StorageHelper.SaveBusLinesAsync(currentData);
@@ -112,6 +133,7 @@ public class BusLineWatcherService : BackgroundService
         // We do this sequentially to be polite to the server
         await CheckSchedulesAsync(currentData.belediye, "belediye-otobusleri", cancellationToken);
         await CheckSchedulesAsync(currentData.ozel_halk, "ozel-halk-otobusleri", cancellationToken);
+        // No schedules for Taksi-Dolmus currently
     }
 
     private async Task CheckSchedulesAsync(List<string> lines, string subfolder, CancellationToken cancellationToken)
@@ -142,51 +164,58 @@ public class BusLineWatcherService : BackgroundService
                         DayTimes = new Dictionary<string, List<string>>()
                     };
                 }
-
-                // 1. Get LineId (fetch HTML if missing OR if we need to check alerts)
-                // We should check alerts periodically too. Let's fetch HTML if we haven't checked alerts in a while or if LineId is missing.
-                // For simplicity, let's fetch HTML every time we check schedules to ensure we catch alerts.
-                // But to be polite, maybe we can combine it. 
-
-                var client = _httpClientFactory.CreateClient();
-                client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-                
-                string html = "";
-                try 
+                else
                 {
-                     html = await _retryPolicy.ExecuteAsync(async () => 
-                        await client.GetStringAsync(url, cancellationToken));
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning($"Failed to fetch HTML for line {name}: {ex.Message}");
-                }
-
-                if (!string.IsNullOrEmpty(html))
-                {
-                    // Check for Line Alerts (Modals)
-                    await CheckForLineAlertsAsync(name, url, html, storedSchedule);
-
-                    if (storedSchedule.LineId == 0)
+                    // Skip if data was checked recently (within the configured interval)
+                    var hoursSinceLastCheck = (DateTime.UtcNow - storedSchedule.LastChecked).TotalHours;
+                    if (hoursSinceLastCheck < _config.Intervals.BusLinesHours)
                     {
-                        storedSchedule.LineId = ExtractLineId(html);
-                        if (storedSchedule.LineId == 0)
-                        {
-                            _logger.LogWarning($"Could not extract LineId for {name}. Url: {url}");
-                            // logic to continue or not? If we can't get LineId, we can't get schedule.
-                            // But we might have gotten an alert.
-                        }
+                        continue;
                     }
                 }
-                else if (storedSchedule.LineId == 0)
+
+                // 1. Get LineId
+                // Try to extract from URL first to avoid unnecessary HTML fetch
+                if (storedSchedule.LineId == 0)
                 {
-                     continue; // Can't do anything without HTML if LineId is missing
+                    storedSchedule.LineId = ExtractLineIdFromUrl(url);
                 }
 
-                // If we still don't have LineId, skip schedule check
-                if (storedSchedule.LineId == 0) continue;
+                string html = "";
+                // Only fetch HTML if we still don't have the LineId
+                if (storedSchedule.LineId == 0)
+                {
+                    var client = _httpClientFactory.CreateClient();
+                    client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
-                // 2. Prepare Dates for API Calls ... (rest of the code)
+                    try 
+                    {
+                         html = await _retryPolicy.ExecuteAsync(async () => 
+                            await client.GetStringAsync(url, cancellationToken));
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning($"Failed to fetch HTML for line {name}: {ex.Message}");
+                    }
+
+                    if (!string.IsNullOrEmpty(html))
+                    {
+                        storedSchedule.LineId = ExtractLineId(html);
+                    }
+                }
+
+                if (storedSchedule.LineId == 0)
+                {
+                     // If still 0, we can't do anything
+                     // Only log if we actually tried to fetch HTML and failed or it didn't help
+                     if (!string.IsNullOrEmpty(html) || storedSchedule.LineId == 0)
+                        _logger.LogWarning($"Could not extract LineId for {name}. Url: {url}");
+                     continue;
+                }
+
+                // Check for announcements is now handled by AnnouncementWatcherService generically for all lines.
+                // We no longer need to check per-line alerts here.
+
 
                 // 2. Prepare Dates for API Calls
                 var now = DateTime.UtcNow.AddHours(3); // Turkey Time
@@ -233,10 +262,7 @@ public class BusLineWatcherService : BackgroundService
                 }
                 else
                 {
-                    // If no schedule change, check if we should save due to alert change?
-                    // We don't know if alert changed. 
-                    // Let's just update LastChecked and Save if > 1 hour OR if LastAlertHash is not empty (slightly aggressive but safer).
-                    
+                    // Save every hour to refresh LastChecked
                     if ((DateTime.UtcNow - storedSchedule.LastChecked).TotalHours > 1)
                     {
                         storedSchedule.LastChecked = DateTime.UtcNow;
@@ -249,6 +275,16 @@ public class BusLineWatcherService : BackgroundService
                 _logger.LogError(ex, $"Error handling schedule for {name}");
             }
         }
+    }
+
+    private int ExtractLineIdFromUrl(string url)
+    {
+        var match = Regex.Match(url, @"-(\d+)$");
+        if (match.Success && int.TryParse(match.Groups[1].Value, out int id))
+        {
+            return id;
+        }
+        return 0;
     }
 
     private int ExtractLineId(string html)
@@ -430,99 +466,71 @@ public class BusLineWatcherService : BackgroundService
         return sb.ToString().Trim();
     }
 
-    private async Task<List<string>> FetchLinesAsync(string url, CancellationToken cancellationToken)
+    private async Task<List<string>> FetchLinesFromApiAsync(int busRequestTypeId, CancellationToken cancellationToken)
     {
+        var url = string.Format(ApiUrl, busRequestTypeId);
         var client = _httpClientFactory.CreateClient();
-        string html = await _retryPolicy.ExecuteAsync(async () =>
-            await client.GetStringAsync(url, cancellationToken));
+        
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Add("Origin", "https://ulasim.sakarya.bel.tr");
+        request.Headers.Add("Referer", "https://ulasim.sakarya.bel.tr");
+        request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
-        var doc = new HtmlDocument();
-        doc.LoadHtml(html);
-
-        var lines = new List<string>();
-        
-        string anchorFilter;
-        if (url.Contains("ozel-halk")) anchorFilter = "/ulasim/ozel-halk/";
-        else if (url.Contains("metrobus")) anchorFilter = "/ulasim/metrobus/";
-        else if (url.Contains("adaray")) anchorFilter = "/ulasim/adaray/";
-        else anchorFilter = "/ulasim/belediye/";
-        
-        var nodes = doc.DocumentNode.SelectNodes($"//a[contains(@href, '{anchorFilter}')]");
-        
-        if (nodes != null)
+        try
         {
-            foreach (var node in nodes)
+            var response = await _retryPolicy.ExecuteAsync(async () => 
+                await client.SendAsync(request, cancellationToken));
+
+            if (!response.IsSuccessStatusCode)
             {
-                var href = node.GetAttributeValue("href", "");
-                if (string.IsNullOrWhiteSpace(href)) continue;
-
-                // Ensure absolute URL
-                if (!href.StartsWith("http")) 
-                {
-                    href = "https://ulasim.sakarya.bel.tr" + (href.StartsWith("/") ? "" : "/") + href;
-                }
-
-                // New scraping requirement:
-                // <span class="card-number">Code</span>
-                // <span class="card-title">Name</span>
-                
-                var numberNode = node.SelectSingleNode(".//span[contains(@class, 'card-number')]");
-                var titleNode = node.SelectSingleNode(".//span[contains(@class, 'card-title')]");
-                
-                string text;
-                
-                if (numberNode != null && titleNode != null)
-                {
-                    var code = numberNode.InnerText.Trim();
-                    var name = titleNode.InnerText.Trim();
-                    
-                    // Decode
-                    code = System.Net.WebUtility.HtmlDecode(code);
-                    name = System.Net.WebUtility.HtmlDecode(name);
-                    
-                    // Format: "21C - CAMİLİ"
-                    text = $"{code} - {name}";
-                }
-                else
-                {
-                    // Fallback to old behavior if spans are missing
-                    text = node.InnerText.Trim();
-                    text = System.Net.WebUtility.HtmlDecode(text);
-                    text = FormatLineName(text, href);
-                }
-
-                // Clean spaces
-                text = Regex.Replace(text, @"\s+", " ").Trim();
-
-                if (string.IsNullOrWhiteSpace(text)) continue;
-
-                // Ensure it looks like a line (starts with digit OR Letter like M1, A1)
-                // Relaxed Check: Must be > 1 char
-                if (text.Length < 2) continue;
-
-                // Valid if starts with Digit or Specific Codes (M1, A1, ADARAY, METROBUS)
-                bool isValidLine = char.IsDigit(text[0]) || 
-                                   text.StartsWith("M", StringComparison.OrdinalIgnoreCase) || 
-                                   text.StartsWith("A", StringComparison.OrdinalIgnoreCase) ||
-                                   text.StartsWith("ADARAY", StringComparison.OrdinalIgnoreCase) ||
-                                   text.StartsWith("METROBÜS", StringComparison.OrdinalIgnoreCase);
-
-                if (isValidLine)
-                {
-                   // Store Name|URL
-                   lines.Add($"{text}|{href}");
-                }
+                _logger.LogWarning($"API request failed for busType {busRequestTypeId}: {response.StatusCode}");
+                return new List<string>();
             }
+
+            var json = await response.Content.ReadAsStringAsync(cancellationToken);
+            if (string.IsNullOrWhiteSpace(json)) return new List<string>();
+
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            
+            if (root.ValueKind != JsonValueKind.Array) return new List<string>();
+
+            var lines = new List<string>();
+
+            foreach (var item in root.EnumerateArray())
+            {
+                // Fields we need:
+                // "lineNumber": "26", "name": "D. MEYDANI - SERDİVAN HAST. - KAMPÜS", "slug": "..."
+                
+                var lineNum = item.GetProperty("lineNumber").GetString()?.Trim() ?? "";
+                var nameStr = item.GetProperty("name").GetString()?.Trim() ?? "";
+                var slug    = item.TryGetProperty("slug", out var s) ? s.GetString() : "";
+
+                if (string.IsNullOrEmpty(lineNum) && string.IsNullOrEmpty(nameStr)) continue;
+
+                // Format Name
+                var culture = new System.Globalization.CultureInfo("tr-TR");
+                nameStr = culture.TextInfo.ToTitleCase(nameStr.ToLower(culture));
+                
+                // Construct display text: "26 - D. Meydani..."
+                var fullText = $"{lineNum} - {nameStr}";
+                
+                // Construct URL
+                // https://ulasim.sakarya.bel.tr/ulasim/{slug}
+                var lineUrl = !string.IsNullOrEmpty(slug) 
+                    ? $"https://ulasim.sakarya.bel.tr/ulasim/{slug}" 
+                    : "";
+
+                lines.Add($"{fullText}|{lineUrl}");
+            }
+            
+            return lines;
         }
-        
-        // Filter out blacklist (check name part)
-        var blacklist = new HashSet<string> { "SAKUS - Ulaşım", "Haberler - Duyurular" }; 
-        
-        return lines
-            .Where(x => !blacklist.Contains(x.Split('|')[0].Trim()))
-            .Distinct()
-            .OrderBy(GetLineSortKey)
-            .ToList();
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Error fetching lines from API (type {busRequestTypeId})");
+            return new List<string>();
+        }
     }
 
     private (int Type, int Number, string? Suffix, string? FullText) GetLineSortKey(string lineEntry)
@@ -549,110 +557,7 @@ public class BusLineWatcherService : BackgroundService
         return (2, 0, null, codePart);
     }
 
-    private string FormatLineName(string rawText, string url)
-    {
-        try 
-        {
-            // rawText examples: "8AORT A GARAJ", "1SAKARYAPARK", "19K KAMPÜS"
-            // url examples: .../8a-orta-garaj, .../1-numara-sakaryapark
-            
-            // 1. Extract Code from URL
-            var uri = new Uri(url);
-            var slug = uri.Segments.LastOrDefault() ?? "";
-            var parts = slug.Split('-');
-            
-            if (parts.Length == 0) return rawText;
-            
-            string code = parts[0]; // "8a", "1", "19k"
-            
-            // Handle split codes in URL like "21-c-..." -> "21c"
-            // If the second part is short (1-2 chars) and not a number, it's likely a suffix
-            if (parts.Length > 1)
-            {
-                var p2 = parts[1];
-                if (p2.Length <= 2 && !char.IsDigit(p2[0]) && 
-                    !string.Equals(p2, "no", StringComparison.OrdinalIgnoreCase) && 
-                    !string.Equals(p2, "numara", StringComparison.OrdinalIgnoreCase))
-                {
-                    code += p2;
-                }
-            }
-            
-            code = code.ToUpper(); // "8A", "1", "19K"
 
-            // 2. Separate Code from Name in rawText
-            // We strip the code from the BEGINNING of rawText
-            
-            // Normalized comparison to find the cut point
-            string cleanRaw = rawText.ToUpper().Replace(" ", "");
-            string cleanCode = code.Replace(" ", "");
-            
-            string namePart = rawText;
-            
-            if (cleanRaw.StartsWith(cleanCode))
-            {
-                // We know rawText *conceptually* starts with the code.
-                // We need to find where the code ENDS in the original rawText string (preserving original chars/spaces for the name part if possible, though we will TitleCase it anyway)
-                
-                // Simple heuristic: match the length of the code, but accounted for potential spaces in rawText?
-                // Actually, if rawText is "8AORT A GARAJ", and code is "8A".
-                // We can just iterate to match characters.
-                
-                int rawIndex = 0;
-                int codeIndex = 0;
-                
-                while (codeIndex < cleanCode.Length && rawIndex < rawText.Length)
-                {
-                    if (char.ToUpper(rawText[rawIndex]) == cleanCode[codeIndex])
-                    {
-                        codeIndex++;
-                    }
-                    else if (char.IsWhiteSpace(rawText[rawIndex]) || rawText[rawIndex] == '-')
-                    {
-                        // skip separators in raw text
-                    }
-                    else
-                    {
-                        // mismatch? - abort approach
-                        break;
-                    }
-                    rawIndex++;
-                }
-                
-                if (codeIndex == cleanCode.Length)
-                {
-                    namePart = rawText.Substring(rawIndex).Trim();
-                    // Clean up leading dashes or spaces
-                    namePart = namePart.TrimStart('-', ' ', '.');
-                }
-            }
-            else
-            {
-                // Fallback: regex to split digits+chars from text
-                // if URL matching failed (e.g. URL says 100, Text says 100B?)
-                 var match = Regex.Match(rawText, @"^(\d+[A-Z\.-]*)(.*)");
-                 if (match.Success)
-                 {
-                     code = match.Groups[1].Value;
-                     namePart = match.Groups[2].Value.TrimStart('-', ' ', '.');
-                 }
-            }
-
-            // 3. Format Name to Title Case
-            var culture = new System.Globalization.CultureInfo("tr-TR");
-            namePart = culture.TextInfo.ToTitleCase(namePart.ToLower(culture));
-            
-            // Final Cleanup of Name
-            // "Ort A Garaj" -> "Orta Garaj" heuristic? 
-            // Maybe safer not to touch spelling for now, just casing.
-            
-            return $"{code} - {namePart}";
-        }
-        catch
-        {
-            return rawText;
-        }
-    }
 
     private async Task<bool> ProcessLineChangesAsync(List<string> oldLines, List<string> newLines, string category)
     {
@@ -697,80 +602,5 @@ public class BusLineWatcherService : BackgroundService
 
         return hasChanges;
     }
-    private async Task CheckForLineAlertsAsync(string lineName, string url, string html, BusSchedule storedSchedule)
-    {
-        try
-        {
-            var doc = new HtmlDocument();
-            doc.LoadHtml(html);
 
-            // Look for the modal structure provided by user:
-            // <div class="content ..."><div class="header"><span class="title ...">Title</span>...</div><div class="text"><p>...</p></div>...</div>
-            // Specifically looking for the title and text content.
-
-            // The user provided snippet has:
-            // <span class="title gotham-medium leaf-300 ...">Planlı Bakım Çalışması</span>
-            // <div class="text ..."><p>...</p></div>
-
-            var titleNode = doc.DocumentNode.SelectSingleNode("//span[contains(@class, 'title') and contains(@class, 'gotham-medium')]");
-            var textNode = doc.DocumentNode.SelectSingleNode("//div[contains(@class, 'text')]");
-
-            if (titleNode != null && textNode != null)
-            {
-                var title = titleNode.InnerText.Trim();
-                var text = textNode.InnerText.Trim();
-                
-                // Clean up html entities
-                title = System.Net.WebUtility.HtmlDecode(title);
-                text = System.Net.WebUtility.HtmlDecode(text);
-
-                if (!string.IsNullOrEmpty(title) && !string.IsNullOrEmpty(text))
-                {
-                    // Compute hash
-                    var contentToHash = $"{title}|{text}";
-                    using var sha = System.Security.Cryptography.SHA256.Create();
-                    var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(contentToHash));
-                    var hash = Convert.ToBase64String(bytes);
-
-                    if (storedSchedule.LastAlertHash != hash)
-                    {
-                        // New Alert!
-                        var msg = $"📢 *Hat Duyurusu: {lineName}*\n\n" +
-                                  $"🔹 *{title}*\n\n" +
-                                  $"{text.Replace("<br>", "\n").Replace("<p>", "").Replace("</p>", "\n")}\n\n" +
-                                  $"🔗 [Detaylar]({url})";
-                        
-                        await _telegramHelper.SendMessageAsync(msg);
-
-                        storedSchedule.LastAlertHash = hash;
-                        // Avoid saving here immediately potentially, wait for schedule save? 
-                        // Or force save because alert is important.
-                        // Let's set it, and let the main loop save if schedule changes OR force save if hash changed but schedule didn't?
-                        // Actually, the main loop checks `storedSchedule.LastScheduleHash != newHash`. 
-                        // We need to signal change.
-                        // But CheckForLineAlertsAsync returns void.
-                        // Let's rely on the fact that if we found an alert, we updated the object in memory.
-                        // We should ensure it gets saved.
-                    }
-                }
-            }
-            else
-            {
-                // No alert found. 
-                // If there WAS an alert before, should we clear the hash?
-                // If we clear it, then if the alert comes back (e.g. intermittent page load), we resend.
-                // If the alert is gone, we can clear it so next time a new alert comes we treat it as new.
-                if (!string.IsNullOrEmpty(storedSchedule.LastAlertHash))
-                {
-                    storedSchedule.LastAlertHash = "";
-                    // Alert removed. Should we notify? Maybe "Alert ended"? 
-                    // Usually users care about active alerts. Silence is fine.
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, $"Error parsing alerts for {lineName}");
-        }
-    }
 }

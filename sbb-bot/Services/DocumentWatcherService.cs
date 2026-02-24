@@ -61,6 +61,14 @@ public class DocumentWatcherService : BackgroundService
 
     private async Task CheckForDocumentsAsync(CancellationToken cancellationToken)
     {
+        int intervalMinutes = _config.Intervals.DocumentsMinutes > 0 ? _config.Intervals.DocumentsMinutes : 1440;
+        var ageMinutes = StorageHelper.GetDataFileAgeMinutes("documents.json");
+        if (ageMinutes < intervalMinutes)
+        {
+            _logger.LogInformation("Documents data is fresh ({0:F0}m old), skipping check.", ageMinutes);
+            return;
+        }
+
         var client = _httpClientFactory.CreateClient();
 
         string html = await _retryPolicy.ExecuteAsync(async () =>
@@ -126,5 +134,8 @@ public class DocumentWatcherService : BackgroundService
              // We update the list to reflect current state so we don't track deleted files forever.
              await StorageHelper.SaveDocumentsAsync(currentDocuments);
         }
+
+        // Mark as checked (touch file even if no new data)
+        StorageHelper.TouchDataFile("documents.json");
     }
 }

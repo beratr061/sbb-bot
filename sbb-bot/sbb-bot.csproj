@@ -20,4 +20,10 @@
     <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
     <PackageReference Include="Telegram.Bot" Version="22.9.0" />
   </ItemGroup>
+
+  <ItemGroup>
+    <Content Update="Data\**">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
 </Project>

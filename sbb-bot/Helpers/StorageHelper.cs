@@ -8,6 +8,18 @@ public static class StorageHelper
                                               ?? Path.Combine(AppContext.BaseDirectory, "Data");
     private static readonly string SchedulePath = Path.Combine(DataPath, "schedules");
 
+    public static string GetDataPath() => DataPath;
+
+    /// <summary>Updates the modification time of a file in DataPath without changing content. Creates it if missing.</summary>
+    public static void TouchDataFile(string fileName)
+    {
+        var path = Path.Combine(DataPath, fileName);
+        if (File.Exists(path))
+            File.SetLastWriteTimeUtc(path, DateTime.UtcNow);
+        else
+            File.WriteAllText(path, "");
+    }
+
     static StorageHelper()
     {
         if (!Directory.Exists(DataPath))
@@ -20,7 +32,21 @@ public static class StorageHelper
         }
     }
     
-    // ... (existing methods omitted for brevity)
+    /// <summary>Returns how long ago (in hours) a data file was last written. Returns double.MaxValue if file doesn't exist.</summary>
+    public static double GetDataFileAgeHours(string fileName)
+    {
+        var path = Path.Combine(DataPath, fileName);
+        if (!File.Exists(path)) return double.MaxValue;
+        return (DateTime.UtcNow - File.GetLastWriteTimeUtc(path)).TotalHours;
+    }
+
+    /// <summary>Returns how long ago (in minutes) a data file was last written. Returns double.MaxValue if file doesn't exist.</summary>
+    public static double GetDataFileAgeMinutes(string fileName)
+    {
+        var path = Path.Combine(DataPath, fileName);
+        if (!File.Exists(path)) return double.MaxValue;
+        return (DateTime.UtcNow - File.GetLastWriteTimeUtc(path)).TotalMinutes;
+    }
 
     public static async Task<BusSchedule?> ReadScheduleAsync(string lineName, string subfolder)
     {
@@ -32,7 +58,15 @@ public static class StorageHelper
         if (!File.Exists(path)) return null;
 
         var json = await File.ReadAllTextAsync(path);
-        return JsonSerializer.Deserialize<BusSchedule>(json);
+        var result = JsonSerializer.Deserialize<BusSchedule>(json);
+        
+        // Fallback for files where LastChecked might be default
+        if (result != null && result.LastChecked == default)
+        {
+            result.LastChecked = File.GetLastWriteTimeUtc(path);
+        }
+        
+        return result;
     }
 
     public static async Task SaveScheduleAsync(BusSchedule schedule, string subfolder)
@@ -196,12 +230,61 @@ public static class StorageHelper
         await File.WriteAllTextAsync(path, json);
     }
 
+    public static async Task<string?> ReadStateAsync(string relativePath)
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, relativePath);
+        if (!File.Exists(path)) return null;
+        return await File.ReadAllTextAsync(path);
+    }
+
+    public static async Task SaveStateAsync(string relativePath, string content)
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, relativePath);
+        var dir = Path.GetDirectoryName(path);
+        if (dir != null && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+        await File.WriteAllTextAsync(path, content);
+    }
+
+    public static async Task<Models.RouteResponse?> ReadRouteDataAsync(string lineId)
+    {
+        var path = Path.Combine(DataPath, "routes", $"{lineId}.json");
+        if (!File.Exists(path)) return null;
+        var json = await File.ReadAllTextAsync(path);
+        var result = JsonSerializer.Deserialize<Models.RouteResponse>(json);
+        
+        // Fallback for files saved before LastChecked was added
+        if (result != null && result.LastChecked == default)
+        {
+            result.LastChecked = File.GetLastWriteTimeUtc(path);
+        }
+        
+        return result;
+    }
+
+    public static async Task SaveRouteDataAsync(Models.RouteResponse data)
+    {
+        var path = Path.Combine(DataPath, "routes", $"{data.LineId}.json");
+        var dir = Path.GetDirectoryName(path);
+        if (dir != null && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+        
+        var options = new JsonSerializerOptions 
+        { 
+            WriteIndented = true, 
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping 
+        };
+        var json = JsonSerializer.Serialize(data, options);
+        await File.WriteAllTextAsync(path, json);
+    }
+
+
 }
 
 public class BusLinesData
 {
     public List<string> ozel_halk { get; set; } = new();
     public List<string> belediye { get; set; } = new();
+    public List<string> taksi_dolmus { get; set; } = new();
+    public List<string> minibus { get; set; } = new();
 }
 
 public class BusSchedule
