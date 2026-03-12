@@ -18,6 +18,8 @@ FROM mcr.microsoft.com/dotnet/runtime:10.0-preview
 WORKDIR /app
 COPY --from=build /app/publish .
 
+ENV DATABASE_URL=""
+
 # Data directory for JSON storage
 # Note: In Railway (without volumes), this data is ephemeral and resets on deploy/restart.
 # The application handles "First Run" scenarios gracefully, so this is acceptable for basic usage.

@@ -17,6 +17,7 @@ public class MeetingWatcherService : BackgroundService
     private readonly ILogger<MeetingWatcherService> _logger;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly TelegramHelper _telegramHelper;
+    private readonly SbbBot.Repositories.HashRepository _repository;
     private readonly BotConfig _config;
     private readonly AsyncRetryPolicy _retryPolicy;
 
@@ -26,11 +27,13 @@ public class MeetingWatcherService : BackgroundService
         ILogger<MeetingWatcherService> logger,
         IHttpClientFactory httpClientFactory,
         TelegramHelper telegramHelper,
+        SbbBot.Repositories.HashRepository repository,
         IOptions<BotConfig> config)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _telegramHelper = telegramHelper;
+        _repository = repository;
         _config = config.Value;
 
         _retryPolicy = Policy
@@ -46,7 +49,8 @@ public class MeetingWatcherService : BackgroundService
     {
         _logger.LogInformation("MeetingWatcherService started.");
 
-        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(_config.Intervals.MeetingMinutes));
+        int intervalMinutes = _config.Intervals.MeetingMinutes > 0 ? _config.Intervals.MeetingMinutes : 1440;
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(intervalMinutes));
 
         do
         {
@@ -63,14 +67,6 @@ public class MeetingWatcherService : BackgroundService
 
     private async Task CheckForMeetingAsync(CancellationToken cancellationToken)
     {
-        int intervalMinutes = _config.Intervals.MeetingMinutes > 0 ? _config.Intervals.MeetingMinutes : 1440;
-        var ageMinutes = StorageHelper.GetDataFileAgeMinutes("meetings.json");
-        if (ageMinutes < intervalMinutes)
-        {
-            _logger.LogInformation("Meeting data is fresh ({0:F0}m old), skipping check.", ageMinutes);
-            return;
-        }
-
         var client = _httpClientFactory.CreateClient();
         string html = await _retryPolicy.ExecuteAsync(async () =>
             await client.GetStringAsync(MeetingUrl, cancellationToken));
@@ -90,12 +86,6 @@ public class MeetingWatcherService : BackgroundService
                 
                 text = System.Net.WebUtility.HtmlDecode(text).Trim();
 
-                // Look for pattern: "DD.MM.YYYY Tarihli..."
-                // Based on user feedback, titles can vary greatly:
-                // "14.11.2025 Tarihli Kasım Ayı Meclis Toplantısı 2. Birleşimi"
-                // "08.12.2020 Tarihli Aralık Ayı Olağanüstü Meclis Toplantısı"
-                // So we just look for anything starting with Date + "Tarihli" and containing "Meclis"
-                
                 if (Regex.IsMatch(text, @"\d{2}\.\d{2}\.\d{4}\s+Tarihli.*Meclis", RegexOptions.IgnoreCase))
                 {
                     currentMeetings.Add(text);
@@ -109,63 +99,35 @@ public class MeetingWatcherService : BackgroundService
             return;
         }
 
-        var storedMeetings = await StorageHelper.ReadMeetingsAsync();
-        var newMeetings = new List<string>();
-        bool isFirstRun = storedMeetings.Count == 0;
+        var isFirstLoad = !await _repository.IsSeededAsync("meetings");
 
         foreach (var meeting in currentMeetings)
         {
-            if (!storedMeetings.Contains(meeting))
+            var hash = ComputeHash(meeting);
+            if (!await _repository.ExistsAsync("meetings", hash))
             {
-                newMeetings.Add(meeting);
-                storedMeetings.Add(meeting);
-            }
-        }
+                await _repository.InsertAsync("meetings", hash, meeting, MeetingUrl, DateTime.UtcNow);
 
-        if (newMeetings.Count > 0)
-        {
-            _logger.LogInformation($"{newMeetings.Count} new meetings detected.");
-            
-            // If it is the first run, we might want to avoid spamming 50+ messages.
-            // But to be consistent with other services, we'll process them. 
-            // However, for usability, maybe we only notify the latest one on first run, or all?
-            // User asked: "all meetings to json, and add new ones as they come".
-            // If I notify 50 times, it might be too much. 
-            // Let's notify for all but in reverse order (oldest to newest) or just newest?
-            // Let's just notify for all. The user can block the bot if it's too much :D
-            // Actually, to be safe, if > 10 new meetings, maybe just notify the latest 5? 
-            // Let's notify all, relying on the retry policy.
-            
-            // Limit first run notification to avoid overwhelming? 
-            // Actually, let's just save them all, but only notify if !isFirstRun to avoid spam on initialization.
-            // But the user complained "only found one". He probably wants to see them in the file.
-            // If I silence the first run notifications, he might think it's broken.
-            // Compromise: On first run, only notify the *latest* (first in list) meeting, but save ALL.
-            
-            if (isFirstRun)
-            {
-                // On first run, just notify the top one (latest date) effectively acting as "Bot is active, here is the latest"
-                // The list from HTML is usually sorted by date desc. 
-                // Let's pick the first one from 'currentMeetings' which is likely the latest.
-                var latest = currentMeetings.FirstOrDefault();
-                if (latest != null)
-                {
-                     await SendMeetingNotificationAsync(latest);
-                }
-            }
-            else
-            {
-                foreach (var meeting in newMeetings)
+                if (!isFirstLoad)
                 {
                     await SendMeetingNotificationAsync(meeting);
+                    await Task.Delay(1000, cancellationToken);
                 }
             }
-            
-            await StorageHelper.SaveMeetingsAsync(storedMeetings);
         }
 
-        // Mark as checked (touch file even if no new data)
-        StorageHelper.TouchDataFile("meetings.json");
+        if (isFirstLoad)
+        {
+            await _repository.MarkAsSeededAsync("meetings");
+            _logger.LogInformation("[{Servis}] İlk yükleme tamamlandı, bildirim atlanıyor.", nameof(MeetingWatcherService));
+        }
+    }
+
+    private string ComputeHash(string content)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(content));
+        return Convert.ToBase64String(bytes);
     }
 
     private async Task SendMeetingNotificationAsync(string title)

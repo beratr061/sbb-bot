@@ -17,6 +17,11 @@ public class InteractionManager
     private readonly VehicleService _vehicleService;
     private readonly IHttpClientFactory _httpClientFactory;
 
+    private readonly SbbBot.Repositories.BusLineRepository _busLineRepository;
+    private readonly SbbBot.Repositories.RouteRepository _routeRepository;
+    private readonly SbbBot.Repositories.AnnouncementRepository _announcementRepository;
+    private readonly SbbBot.Repositories.FareRepository _fareRepository;
+
     // Cache line list in memory for quick search
     private List<LineItem> _cachedLines = new();
     private DateTime _lastCacheTime = DateTime.MinValue;
@@ -25,12 +30,20 @@ public class InteractionManager
         ITelegramBotClient botClient,
         ILogger<InteractionManager> logger,
         IHttpClientFactory httpClientFactory,
-        VehicleService vehicleService)
+        VehicleService vehicleService,
+        SbbBot.Repositories.BusLineRepository busLineRepository,
+        SbbBot.Repositories.RouteRepository routeRepository,
+        SbbBot.Repositories.AnnouncementRepository announcementRepository,
+        SbbBot.Repositories.FareRepository fareRepository)
     {
         _botClient = botClient;
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _vehicleService = vehicleService;
+        _busLineRepository = busLineRepository;
+        _routeRepository = routeRepository;
+        _announcementRepository = announcementRepository;
+        _fareRepository = fareRepository;
     }
 
     // ... (existing code omitted)
@@ -280,7 +293,17 @@ public class InteractionManager
 
     private async Task ShowLineRouteInfoAsync(long chatId, int lineId, CancellationToken token, int messageId)
     {
-        var route = await StorageHelper.ReadRouteDataAsync(lineId.ToString());
+        await EnsureLinesLoadedAsync();
+        var line = _cachedLines.FirstOrDefault(x => x.Id == lineId);
+        if (line == null) return;
+
+        var json = await _routeRepository.GetRawJsonAsync(line.LineNumber, "ALL");
+        Models.RouteResponse route = null;
+        if (!string.IsNullOrEmpty(json))
+        {
+            try { route = JsonSerializer.Deserialize<Models.RouteResponse>(json); } catch { }
+        }
+
         var text = "";
         
         if (route != null && route.Routes.Any())
@@ -348,7 +371,7 @@ public class InteractionManager
         buttons.Add(new List<InlineKeyboardButton> { InlineKeyboardButton.WithCallbackData("🔙 Geri Dön", "cmd_hat_secim") });
 
         var keyboard = new InlineKeyboardMarkup(buttons);
-        var title = category.ToUpper() switch { "BELEDIYE" => "🔴 Belediye", "OZEL" => "🔵 Özel Halk", "MINIBUS" => "🟣 Minibüs", "TAKSI" => "� Taksi Dolmuş", _ => category };
+        var title = category.ToUpper() switch { "BELEDIYE" => "🔴 Belediye", "OZEL" => "🔵 Özel Halk", "MINIBUS" => "🟣 Minibüs", "TAKSI" => "🟡 Taksi Dolmuş", _ => category };
         
         await _botClient.EditMessageText(chatId, messageId, $"📄 **{title} Hatları** (Sayfa {page+1})", parseMode: ParseMode.Markdown, replyMarkup: keyboard, cancellationToken: token);
     }
@@ -357,7 +380,7 @@ public class InteractionManager
     {
         await EnsureLinesLoadedAsync();
         var line = _cachedLines.FirstOrDefault(x => x.Id == lineId);
-        if (line == null) { await _botClient.AnswerCallbackQuery("Hat bulunamadı.", chatId.ToString()); return; }
+        if (line == null) { return; }
 
         var text = $"🚍 **{line.Display}**\n\nBu hat ile ilgili ne yapmak istersiniz?";
 
@@ -387,12 +410,7 @@ public class InteractionManager
 
     private async Task ShowLineScheduleAsync(long chatId, int lineId, CancellationToken token, int messageId)
     {
-        var schedule = await StorageHelper.ReadScheduleAsync(lineId.ToString(), "belediye-otobusleri"); // Todo: dynamic subfolder?
-        // Actually we don't know the exact subfolder easily without trying. 
-        // But we can fetch it live? No, user wanted from cache.
-        // Let's create a helper to find schedule by searching subfolders.
-        
-        schedule ??= await FindScheduleAnywhere(lineId);
+        var schedule = await FindScheduleAnywhere(lineId);
 
         var text = "";
         if (schedule != null && schedule.DayTimes.Any())
@@ -422,40 +440,32 @@ public class InteractionManager
         if (_cachedLines.Count > 0 && (DateTime.Now - _lastCacheTime).TotalMinutes < 30) return;
 
         _cachedLines.Clear();
-        var data = await StorageHelper.ReadBusLinesAsync();
+        var lines = await _busLineRepository.GetAllAsync();
         
-        foreach (var l in data.belediye) AddLine(l, "Belediye");
-        foreach (var l in data.ozel_halk) AddLine(l, "Özel Halk");
-        foreach (var l in data.taksi_dolmus) AddLine(l, "Taksi-Dolmuş");
-        foreach (var l in data.minibus) AddLine(l, "Minibüs");
+        foreach (var l in lines)
+        {
+            int lineId = l.ApiId;
 
+            // Fallback: try to get LineId from RawJson (BusSchedule) if ApiId is not set
+            if (lineId == 0 && !string.IsNullOrEmpty(l.RawJson))
+            {
+                try
+                {
+                    var schedule = JsonSerializer.Deserialize<BusSchedule>(l.RawJson);
+                    lineId = schedule?.LineId ?? 0;
+                }
+                catch { }
+            }
+
+            _cachedLines.Add(new LineItem 
+            { 
+                Id = lineId, 
+                LineNumber = l.LineNumber,
+                Display = $"{l.LineNumber} - {l.LineName}".Trim(' ', '-'), 
+                Type = l.BusType 
+            });
+        }
         _lastCacheTime = DateTime.Now;
-    }
-
-    private void AddLine(string entry, string type)
-    {
-        // Entry format: "24K - KAMPUS|URL"
-        var parts = entry.Split('|');
-        var namePart = parts[0];
-        // Parse ID from somewhere? 
-        // Wait, the "lines" list strings don't have IDs directly visible in that format "Number - Name".
-        // BUT, we stored them as "FullText|Url". URL contains slug "num-name-ID".
-        // We need to extract ID from slug.
-        
-        var url = parts.Length > 1 ? parts[1] : "";
-        int id = 0;
-
-        if (!string.IsNullOrEmpty(url))
-        {
-            var slug = url.Split('/').Last();
-            var idPart = slug.Split('-').Last();
-            int.TryParse(idPart, out id);
-        }
-
-        if (id != 0)
-        {
-            _cachedLines.Add(new LineItem { Id = id, Display = namePart, Type = type });
-        }
     }
 
     private async Task SearchLineAsync(long chatId, string query, CancellationToken token)
@@ -476,27 +486,18 @@ public class InteractionManager
 
     private async Task<BusSchedule?> FindScheduleAnywhere(int lineId)
     {
-        // Try known folders
-        var folders = new[] { "belediye-otobusleri", "ozel-halk-otobusleri" };
-        foreach (var f in folders)
-        {
-            // We need the line Name to find the file... StorageHelper takes name.
-            // But we only have ID here.
-            // This is a design flaw in my storage strategy (Keying by Name instead of ID).
-            // Workaround: Find name from cached list then load.
-            
-            var line = _cachedLines.FirstOrDefault(x => x.Id == lineId);
-            if (line == null) continue;
+        await EnsureLinesLoadedAsync();
+        var line = _cachedLines.FirstOrDefault(x => x.Id == lineId);
+        if (line == null) return null;
 
-            // The file is named like "24K_-_Name.json"
-            // Let's try to match the file in directory?
-            // Or change ReadScheduleAsync to iterate?
-            
-            // For now, let's look for a file that contains the ID inside content? No, slow.
-            // Best bet: The line.Display acts as name.
-            
-            var schedule = await StorageHelper.ReadScheduleAsync(line.Display, f);
-            if (schedule != null) return schedule;
+        var dbLine = await _busLineRepository.GetByLineNumberAsync(line.LineNumber);
+        if (dbLine != null && !string.IsNullOrEmpty(dbLine.RawJson))
+        {
+            try
+            {
+                return JsonSerializer.Deserialize<BusSchedule>(dbLine.RawJson);
+            }
+            catch { }
         }
         return null;
     }
@@ -508,16 +509,15 @@ public class InteractionManager
         try
         {
             string? json = null;
-            var cacheDir = Path.Combine(StorageHelper.GetDataPath(), "fare_cache");
-            var cachePath = Path.Combine(cacheDir, $"{lineId}.json");
+            var fare = await _fareRepository.GetByLineNumberAsync(lineId.ToString());
 
             // Try reading from cache first (valid for 24 hours)
-            if (File.Exists(cachePath))
+            if (fare != null && !string.IsNullOrEmpty(fare.RawJson))
             {
-                var age = (DateTime.UtcNow - File.GetLastWriteTimeUtc(cachePath)).TotalHours;
+                var age = (DateTime.UtcNow - fare.UpdatedAt).TotalHours;
                 if (age < 24)
                 {
-                    json = await File.ReadAllTextAsync(cachePath, token);
+                    json = fare.RawJson;
                 }
             }
 
@@ -542,11 +542,17 @@ public class InteractionManager
 
                 json = await response.Content.ReadAsStringAsync(token);
 
-                // Save to cache
+                // Save to DB
                 try
                 {
-                    if (!Directory.Exists(cacheDir)) Directory.CreateDirectory(cacheDir);
-                    await File.WriteAllTextAsync(cachePath, json, token);
+                    var newFare = new Fare 
+                    {
+                        LineNumber = lineId.ToString(),
+                        FullFare = 0, // Not explicitly extracted here, relying on watcher for line 137
+                        StudentFare = 0,
+                        RawJson = json
+                    };
+                    await _fareRepository.UpsertAsync(newFare);
                 }
                 catch { /* Cache write failure is non-critical */ }
             }
@@ -619,31 +625,34 @@ public class InteractionManager
         string text;
         try
         {
-            var dataPath = Path.Combine(StorageHelper.GetDataPath(), "announcement_data.json");
-            if (!File.Exists(dataPath))
+            // Find line display name to match announcements
+            await EnsureLinesLoadedAsync();
+            var line = _cachedLines.FirstOrDefault(x => x.Id == lineId);
+
+            var dbAnnouncements = await _announcementRepository.GetAllAsync();
+            
+            if (dbAnnouncements.Count == 0 || line == null)
             {
-                text = "📢 **Duyurular**\n\nDuyuru verisi henüz yüklenmedi.";
+                text = "📢 **Duyurular**\n\nBu hat için aktif bir duyuru bulunmuyor veya duyuru verisi yüklenmedi.";
             }
             else
             {
-                var json = await File.ReadAllTextAsync(dataPath, token);
-                using var doc = JsonDocument.Parse(json);
-                var root = doc.RootElement;
-
-                // Find line display name to match announcements
-                await EnsureLinesLoadedAsync();
-                var line = _cachedLines.FirstOrDefault(x => x.Id == lineId);
-
                 var sb = new StringBuilder();
                 sb.AppendLine("📢 **Duyurular**");
                 sb.AppendLine();
 
                 bool found = false;
+                var turkey = TimeZoneInfo.FindSystemTimeZoneById("Turkey Standard Time");
 
-                if (root.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
+                foreach (var dbitem in dbAnnouncements)
                 {
-                    foreach (var item in items.EnumerateArray())
+                    if (string.IsNullOrEmpty(dbitem.RawJson)) continue;
+
+                    try
                     {
+                        using var doc = JsonDocument.Parse(dbitem.RawJson);
+                        var item = doc.RootElement;
+
                         // Check if this announcement belongs to this line
                         int? announcementLineId = null;
                         if (item.TryGetProperty("lineId", out var lidEl) && lidEl.ValueKind == JsonValueKind.Number)
@@ -663,11 +672,9 @@ public class InteractionManager
                         if (!matches) continue;
 
                         found = true;
-                        var title = item.TryGetProperty("title", out var tEl) ? tEl.GetString() ?? "" : "";
-                        var content = item.TryGetProperty("content", out var cEl) ? cEl.GetString() ?? "" : "";
+                        var title = dbitem.Title;
+                        var content = dbitem.Content;
                         var category = item.TryGetProperty("categoryName", out var catEl) ? catEl.GetString() ?? "" : "";
-                        var startDate = item.TryGetProperty("startDate", out var sdEl) ? sdEl.GetString() : null;
-                        var endDate = item.TryGetProperty("endDate", out var edEl) ? edEl.GetString() : null;
 
                         sb.AppendLine($"🔔 *{title}*");
                         if (!string.IsNullOrEmpty(category))
@@ -682,22 +689,20 @@ public class InteractionManager
                             sb.AppendLine(cleanContent);
 
                         // Date range
-                        var turkey = TimeZoneInfo.FindSystemTimeZoneById("Turkey Standard Time");
-                        if (!string.IsNullOrEmpty(startDate) && DateTime.TryParse(startDate, null,
-                                System.Globalization.DateTimeStyles.RoundtripKind, out var start))
+                        if (dbitem.StartDate.HasValue)
                         {
-                            var startLocal = TimeZoneInfo.ConvertTimeFromUtc(start, turkey);
+                            var startLocal = TimeZoneInfo.ConvertTimeFromUtc(dbitem.StartDate.Value, turkey);
                             sb.Append($"\n📅 _{startLocal:dd.MM.yyyy HH:mm}");
-                            if (!string.IsNullOrEmpty(endDate) && DateTime.TryParse(endDate, null,
-                                    System.Globalization.DateTimeStyles.RoundtripKind, out var end))
+                            if (dbitem.EndDate.HasValue)
                             {
-                                var endLocal = TimeZoneInfo.ConvertTimeFromUtc(end, turkey);
+                                var endLocal = TimeZoneInfo.ConvertTimeFromUtc(dbitem.EndDate.Value, turkey);
                                 sb.Append($" — {endLocal:dd.MM.yyyy HH:mm}");
                             }
                             sb.AppendLine("_");
                         }
                         sb.AppendLine();
                     }
+                    catch { }
                 }
 
                 if (!found)
@@ -722,6 +727,7 @@ public class InteractionManager
 public class LineItem
 {
     public int Id { get; set; }
+    public string LineNumber { get; set; } = "";
     public string Display { get; set; } = "";
     public string Type { get; set; } = "";
 }

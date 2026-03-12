@@ -22,4 +22,5 @@ public class IntervalsConfig
     public int UkomeMinutes { get; set; }
     public int FareMinutes { get; set; }
     public int RouteMinutes { get; set; }
+    public int NeonPingMinutes { get; set; }
 }

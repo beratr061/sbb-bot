@@ -3,39 +3,39 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 using SbbBot.Helpers;
+using SbbBot.Models;
+using SbbBot.Repositories;
 
 namespace SbbBot.Services;
 
 /// <summary>
 /// Fetches ALL active line announcements from the public API in a SINGLE request.
 /// This avoids per-line polling and is friendly to the server.
-///
-/// API: GET https://sbbpublicapi.sakarya.bel.tr/api/v1/Ulasim/announcement?pageSize=100
-/// Returns all currently active announcements across all lines.
 /// </summary>
 public class AnnouncementWatcherService : BackgroundService
 {
     private const string ApiUrl = "https://sbbpublicapi.sakarya.bel.tr/api/v1/Ulasim/announcement?pageSize=100";
-    private const string StateFile = "Data/announcements.json";
 
     private readonly ILogger<AnnouncementWatcherService> _logger;
     private readonly TelegramHelper _telegramHelper;
+    private readonly IDiscordHelper _discordHelper;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly TimeSpan _pollInterval;
-
-    // In-memory state: announcementId -> hash of (title + content)
-    // Persisted to disk so restarts don't cause duplicate notifications.
-    private Dictionary<int, string> _seenHashes = new();
+    private readonly AnnouncementRepository _repository;
 
     public AnnouncementWatcherService(
         ILogger<AnnouncementWatcherService> logger,
         TelegramHelper telegramHelper,
+        IDiscordHelper discordHelper,
         IHttpClientFactory httpClientFactory,
-        IOptions<BotConfig> config)
+        IOptions<BotConfig> config,
+        AnnouncementRepository repository)
     {
         _logger = logger;
         _telegramHelper = telegramHelper;
+        _discordHelper = discordHelper;
         _httpClientFactory = httpClientFactory;
+        _repository = repository;
         _pollInterval = TimeSpan.FromMinutes(config.Value.Intervals.AnnouncementMinutes > 0
             ? config.Value.Intervals.AnnouncementMinutes
             : 10);
@@ -44,8 +44,6 @@ public class AnnouncementWatcherService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("AnnouncementWatcherService started. Poll interval: {Interval}", _pollInterval);
-
-        LoadState();
 
         // Small startup delay so other services initialize first
         await Task.Delay(TimeSpan.FromSeconds(20), stoppingToken);
@@ -100,15 +98,14 @@ public class AnnouncementWatcherService : BackgroundService
         if (!root.TryGetProperty("items", out var items) ||
             items.ValueKind != JsonValueKind.Array) return;
 
-        var activeIds = new HashSet<int>();
-        var stateChanged = false;
         var turkey = TimeZoneInfo.FindSystemTimeZoneById("Turkey Standard Time");
+
+        bool isFirstLoad = !await _repository.IsSeededAsync();
 
         foreach (var item in items.EnumerateArray())
         {
             if (!item.TryGetProperty("id", out var idEl)) continue;
             var id = idEl.GetInt32();
-            activeIds.Add(id);
 
             var title    = item.TryGetProperty("title",    out var tEl) ? tEl.GetString() ?? "" : "";
             var content  = item.TryGetProperty("content",  out var cEl) ? cEl.GetString() ?? "" : "";
@@ -116,19 +113,42 @@ public class AnnouncementWatcherService : BackgroundService
             var lineNum  = item.TryGetProperty("lineNumber", out var nEl) ? nEl.GetString() ?? "" : "";
             var category = item.TryGetProperty("categoryName", out var catEl) ? catEl.GetString() ?? "" : "";
             var slug     = item.TryGetProperty("slug",     out var sEl) ? sEl.GetString() ?? "" : "";
-            var startDate = item.TryGetProperty("startDate", out var sdEl) ? sdEl.GetString() : null;
-            var endDate   = item.TryGetProperty("endDate",   out var edEl) ? edEl.GetString() : null;
+            var startDateStr = item.TryGetProperty("startDate", out var sdEl) ? sdEl.GetString() : null;
+            var endDateStr   = item.TryGetProperty("endDate",   out var edEl) ? edEl.GetString() : null;
 
-            // Hash detects real content changes
+            DateTime? startDate = null;
+            if (DateTime.TryParse(startDateStr, null, System.Globalization.DateTimeStyles.RoundtripKind, out var start))
+            {
+                startDate = start.ToUniversalTime();
+            }
+
+            DateTime? endDate = null;
+            if (DateTime.TryParse(endDateStr, null, System.Globalization.DateTimeStyles.RoundtripKind, out var end))
+            {
+                endDate = end.ToUniversalTime();
+            }
+
             var hash = ComputeHash($"{id}|{title}|{content}");
 
-            if (_seenHashes.TryGetValue(id, out var existingHash) && existingHash == hash)
-                continue; // No change for this announcement
+            bool exists = await _repository.ExistsAsync(id.ToString());
 
-            // New or updated announcement — send notification
-            _seenHashes[id] = hash;
-            stateChanged = true;
+            var announcement = new Announcement
+            {
+                AnnouncementId = id.ToString(),
+                Title = title,
+                Content = content,
+                StartDate = startDate,
+                EndDate = endDate,
+                ContentHash = hash,
+                RawJson = item.ToString(),
+                CreatedAt = DateTime.UtcNow
+            };
 
+            await _repository.InsertAsync(announcement);
+
+            if (isFirstLoad || exists) continue;
+
+            // Send notification
             var lineUrl = !string.IsNullOrEmpty(slug)
                 ? $"https://ulasim.sakarya.bel.tr/ulasim/{slug}"
                 : "https://ulasim.sakarya.bel.tr";
@@ -136,25 +156,21 @@ public class AnnouncementWatcherService : BackgroundService
             var messageText = HtmlToMarkdown(content);
 
             var msg = new StringBuilder();
-            msg.AppendLine($"📢 *Hat Duyurusu: {lineNum} {lineName}*".Trim('*').Trim() is var plain
-                ? $"📢 *Hat Duyurusu: {lineNum} {lineName}*"
-                : "");
+            msg.AppendLine($"📢 *Hat Duyurusu: {TelegramHelper.EscapeMarkdown(lineNum)} {TelegramHelper.EscapeMarkdown(lineName)}*");
             if (!string.IsNullOrEmpty(category))
-                msg.AppendLine($"🏷 _{category}_");
+                msg.AppendLine($"🏷 _{TelegramHelper.EscapeMarkdown(category)}_");
             msg.AppendLine();
-            msg.AppendLine($"🔔 *{title}*");
+            msg.AppendLine($"🔔 *{TelegramHelper.EscapeMarkdown(title)}*");
             msg.AppendLine();
             msg.AppendLine(messageText);
 
-            if (!string.IsNullOrEmpty(startDate) && DateTime.TryParse(startDate, null,
-                    System.Globalization.DateTimeStyles.RoundtripKind, out var start))
+            if (startDate.HasValue)
             {
-                var startLocal = TimeZoneInfo.ConvertTimeFromUtc(start, turkey);
+                var startLocal = TimeZoneInfo.ConvertTimeFromUtc(startDate.Value, turkey);
                 msg.Append($"\n📅 _{startLocal:dd.MM.yyyy HH:mm}");
-                if (!string.IsNullOrEmpty(endDate) && DateTime.TryParse(endDate, null,
-                        System.Globalization.DateTimeStyles.RoundtripKind, out var end))
+                if (endDate.HasValue)
                 {
-                    var endLocal = TimeZoneInfo.ConvertTimeFromUtc(end, turkey);
+                    var endLocal = TimeZoneInfo.ConvertTimeFromUtc(endDate.Value, turkey);
                     msg.Append($" — {endLocal:dd.MM.yyyy HH:mm}");
                 }
                 msg.AppendLine("_");
@@ -164,70 +180,22 @@ public class AnnouncementWatcherService : BackgroundService
             msg.Append($"🔗 [Detaylar]({lineUrl})");
 
             await _telegramHelper.SendMessageAsync(msg.ToString());
+
+            try
+            {
+                var embed = DiscordEmbedBuilder.AnnouncementNew(title, content, startDate ?? DateTime.UtcNow, endDate ?? DateTime.UtcNow);
+                var buttonUrl = "https://ulasim.sakarya.bel.tr/duyurular";
+                await _discordHelper.SendEmbedWithButtonAsync("SAKUS", "sakarya-ulasim", embed, "📢 Tüm Duyurular", buttonUrl);
+            }
+            catch (Exception ex) { _logger.LogWarning("[Discord] Gönderilemedi: {Ex}", ex.Message); }
+
             _logger.LogInformation("Announcement notification sent: [{Id}] {Title} ({Line})", id, title, lineName);
         }
 
-        // Remove IDs that are no longer in the active list
-        // so they'll be notified again if they come back.
-        var removedIds = _seenHashes.Keys.Except(activeIds).ToList();
-        foreach (var rid in removedIds)
+        if (isFirstLoad)
         {
-            _seenHashes.Remove(rid);
-            stateChanged = true;
-            _logger.LogInformation("Announcement {Id} is no longer active, cleared from state", rid);
-        }
-
-        if (stateChanged) SaveState();
-
-        // Save full announcement data for InteractionManager to read
-        SaveAnnouncementData(json);
-    }
-
-    // ── State persistence ─────────────────────────────────────────────────────
-
-    private void LoadState()
-    {
-        try
-        {
-            if (!File.Exists(StateFile)) return;
-            var json = File.ReadAllText(StateFile);
-            _seenHashes = JsonSerializer.Deserialize<Dictionary<int, string>>(json) ?? new();
-            _logger.LogInformation("Loaded {Count} announcement state entries", _seenHashes.Count);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Could not load announcement state — starting fresh");
-            _seenHashes = new();
-        }
-    }
-
-    private void SaveState()
-    {
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(StateFile)!);
-            var json = JsonSerializer.Serialize(_seenHashes,
-                new JsonSerializerOptions { WriteIndented = false });
-            File.WriteAllText(StateFile, json);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Could not save announcement state");
-        }
-    }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private void SaveAnnouncementData(string json)
-    {
-        try
-        {
-            var path = Path.Combine(StorageHelper.GetDataPath(), "announcement_data.json");
-            File.WriteAllText(path, json);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Could not save announcement data");
+            await _repository.MarkAsSeededAsync();
+            _logger.LogInformation("[{Servis}] İlk yükleme tamamlandı, bildirim atlanıyor.", nameof(AnnouncementWatcherService));
         }
     }
 

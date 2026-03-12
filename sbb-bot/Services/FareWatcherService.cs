@@ -4,8 +4,10 @@ using Microsoft.Extensions.Options;
 using Polly;
 using Polly.Retry;
 using SbbBot.Helpers;
+using SbbBot.Models;
+using SbbBot.Repositories;
+using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 
 namespace SbbBot.Services;
 
@@ -14,26 +16,30 @@ public class FareWatcherService : BackgroundService
     private readonly ILogger<FareWatcherService> _logger;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly TelegramHelper _telegramHelper;
+    private readonly IDiscordHelper _discordHelper;
     private readonly BotConfig _config;
     private readonly AsyncRetryPolicy _retryPolicy;
+    private readonly FareRepository _repository;
+    private readonly BusLineRepository _busLineRepository;
 
-    // We will check a representative line to detect general fare hikes.
-    // Line 137 (A1/Sakarya) is used as reference based on user's sample.
-    // We could check multiple if needed, but usually hikes are city-wide.
-    private const int ReferenceLineId = 137; 
-    private const string ApiUrl = "https://sbbpublicapi.sakarya.bel.tr/api/v1/Ulasim/line-fare/{0}?busType=3869";
-    private const string StateFile = "Data/fare_state.json";
+    private const string FareApiUrl = "https://sbbpublicapi.sakarya.bel.tr/api/v1/Ulasim/line-fare/{0}?busType=3869";
 
     public FareWatcherService(
         ILogger<FareWatcherService> logger,
         IHttpClientFactory httpClientFactory,
         TelegramHelper telegramHelper,
-        IOptions<BotConfig> config)
+        IDiscordHelper discordHelper,
+        IOptions<BotConfig> config,
+        FareRepository repository,
+        BusLineRepository busLineRepository)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _telegramHelper = telegramHelper;
+        _discordHelper = discordHelper;
         _config = config.Value;
+        _repository = repository;
+        _busLineRepository = busLineRepository;
 
         _retryPolicy = Policy
             .Handle<Exception>()
@@ -48,14 +54,14 @@ public class FareWatcherService : BackgroundService
     {
         _logger.LogInformation("FareWatcherService started.");
 
-        int intervalMinutes = _config.Intervals.FareMinutes > 0 ? _config.Intervals.FareMinutes : 1440; // Default daily
+        int intervalMinutes = _config.Intervals.FareMinutes > 0 ? _config.Intervals.FareMinutes : 1440;
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(intervalMinutes));
 
         do
         {
             try
             {
-                await CheckFaresAsync(stoppingToken);
+                await CheckAllFaresAsync(stoppingToken);
             }
             catch (Exception ex)
             {
@@ -64,47 +70,149 @@ public class FareWatcherService : BackgroundService
         } while (await timer.WaitForNextTickAsync(stoppingToken) && !stoppingToken.IsCancellationRequested);
     }
 
-    private async Task CheckFaresAsync(CancellationToken cancellationToken)
+    private async Task CheckAllFaresAsync(CancellationToken cancellationToken)
     {
-        int intervalMinutes = _config.Intervals.FareMinutes > 0 ? _config.Intervals.FareMinutes : 1440;
-        var ageMinutes = StorageHelper.GetDataFileAgeMinutes("fare_state.json");
-        if (ageMinutes < intervalMinutes)
+        bool isFirstLoad = !await _repository.IsSeededAsync();
+
+        // Get all lines from DB
+        var allLines = await _busLineRepository.GetAllAsync();
+        if (allLines.Count == 0)
         {
-            _logger.LogInformation("Fare data is fresh ({0:F0}m old), skipping check.", ageMinutes);
+            _logger.LogWarning("FareWatcherService: No bus lines in DB yet. Skipping fare check.");
             return;
         }
 
-        var fareData = await FetchFareDataAsync(ReferenceLineId, cancellationToken);
-        if (fareData == null) return;
+        _logger.LogInformation("FareWatcherService: Checking fares for {Count} lines...", allLines.Count);
 
-        var storedHash = await StorageHelper.ReadStateAsync(StateFile);
-        var currentHash = ComputeFareHash(fareData);
+        int processedCount = 0;
+        int changedCount = 0;
 
-        if (storedHash != currentHash)
+        foreach (var line in allLines)
         {
-            if (!string.IsNullOrEmpty(storedHash))
+            if (cancellationToken.IsCancellationRequested) break;
+
+            // Use ApiId for API call; skip if no ApiId
+            if (line.ApiId == 0)
             {
-                // Parse and notify
-                await NotifyFareChangeAsync(fareData);
-            }
-            else
-            {
-                 _logger.LogInformation("Initial fare data stored.");
+                continue;
             }
 
-            await StorageHelper.SaveStateAsync(StateFile, currentHash);
+            try
+            {
+                bool changed = await ProcessLineFareAsync(line, isFirstLoad, cancellationToken);
+                if (changed) changedCount++;
+                processedCount++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error processing fare for line {LineNumber}", line.LineNumber);
+            }
+
+            // Delay between API calls to avoid rate limiting
+            await Task.Delay(500, cancellationToken);
         }
 
-        // Mark as checked (touch file even if no change)
-        StorageHelper.TouchDataFile("fare_state.json");
+        if (isFirstLoad)
+        {
+            await _repository.MarkAsSeededAsync();
+            _logger.LogInformation("[{Servis}] İlk yükleme tamamlandı ({Count} hat), bildirim atlanıyor.", 
+                nameof(FareWatcherService), processedCount);
+        }
+        else
+        {
+            _logger.LogInformation("FareWatcherService: {Processed} hat kontrol edildi, {Changed} değişiklik tespit edildi.", 
+                processedCount, changedCount);
+        }
     }
 
-    private async Task<JsonElement?> FetchFareDataAsync(int lineId, CancellationToken token)
+    /// <summary>
+    /// Fetches fare for a single line, compares with stored data, and sends notification if changed.
+    /// Returns true if fare changed.
+    /// </summary>
+    private async Task<bool> ProcessLineFareAsync(BusLine line, bool isFirstLoad, CancellationToken cancellationToken)
+    {
+        var fareData = await FetchFareDataAsync(line.ApiId, cancellationToken);
+        if (fareData == null) return false;
+
+        var r = fareData.Value;
+        var (fullFare, studentFare, discountedFare) = ExtractFares(r);
+
+        // Skip if no fare data returned
+        if (fullFare == 0 && studentFare == 0) return false;
+
+        var fareEntity = new Fare
+        {
+            LineNumber = line.LineNumber,
+            FullFare = fullFare,
+            StudentFare = studentFare,
+            DiscountedFare = discountedFare,
+            RawJson = r.ToString()
+        };
+
+        if (isFirstLoad)
+        {
+            // Seed: save without notification
+            await _repository.UpsertAsync(fareEntity);
+            return false;
+        }
+
+        var storedFare = await _repository.GetByLineNumberAsync(line.LineNumber);
+
+        if (storedFare == null || 
+            storedFare.FullFare != fullFare || 
+            storedFare.StudentFare != studentFare || 
+            storedFare.DiscountedFare != discountedFare)
+        {
+            await NotifyFareChangeAsync(line, storedFare, fareEntity, fareData);
+            await _repository.UpsertAsync(fareEntity);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Extracts full, student, and discounted fares from the API response.
+    /// </summary>
+    private (decimal fullFare, decimal studentFare, decimal discountedFare) ExtractFares(JsonElement r)
+    {
+        decimal fullFare = 0, studentFare = 0, discountedFare = 0;
+
+        if (r.TryGetProperty("groups", out var groups) && groups.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var group in groups.EnumerateArray())
+            {
+                if (group.TryGetProperty("routes", out var routes))
+                {
+                    foreach (var route in routes.EnumerateArray())
+                    {
+                        if (route.TryGetProperty("tariffs", out var tariffs))
+                        {
+                            foreach (var tariff in tariffs.EnumerateArray())
+                            {
+                                var finalFare = tariff.GetProperty("finalFare").GetDecimal();
+                                var typeId = tariff.GetProperty("lineFareTypeId").GetInt32();
+                                var typeName = GetTariffName(r, typeId);
+
+                                if (typeName.Contains("Tam", StringComparison.OrdinalIgnoreCase)) fullFare = finalFare;
+                                else if (typeName.Contains("Öğrenci", StringComparison.OrdinalIgnoreCase)) studentFare = finalFare;
+                                else if (typeName.Contains("İndirimli", StringComparison.OrdinalIgnoreCase)) discountedFare = finalFare;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return (fullFare, studentFare, discountedFare);
+    }
+
+    private async Task<JsonElement?> FetchFareDataAsync(int lineApiId, CancellationToken token)
     {
         try
         {
             var client = _httpClientFactory.CreateClient();
-            var url = string.Format(ApiUrl, lineId);
+            var url = string.Format(FareApiUrl, lineApiId);
 
             var request = new HttpRequestMessage(HttpMethod.Get, url);
             request.Headers.Add("Origin", "https://ulasim.sakarya.bel.tr");
@@ -118,82 +226,71 @@ public class FareWatcherService : BackgroundService
 
             var json = await response.Content.ReadAsStringAsync(token);
             using var doc = JsonDocument.Parse(json);
-            return doc.RootElement.Clone(); // Clone to detach from disposable doc
+            return doc.RootElement.Clone();
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, $"Error fetching fare data for line {lineId}");
+            _logger.LogError(ex, "Error fetching fare data for line API id {LineApiId}", lineApiId);
             return null;
         }
     }
 
-    private string ComputeFareHash(JsonElement? root)
+    /// <summary>
+    /// Sends a Telegram notification about fare change for a specific line.
+    /// </summary>
+    private async Task NotifyFareChangeAsync(BusLine line, Fare? oldFare, Fare newFare, JsonElement? fareData)
     {
-        if (root == null) return "";
-        // Simple hash of the JSON string
-        // For more precision, we could just extract prices.
-        // Let's rely on string content as order usually stable from API.
-        var raw = root.Value.GetRawText();
-        using var sha = System.Security.Cryptography.SHA256.Create();
-        var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(raw));
-        return Convert.ToBase64String(bytes);
-    }
+        var sb = new StringBuilder();
+        var escapedLineNum = TelegramHelper.EscapeMarkdown(line.LineNumber);
+        var escapedLineName = TelegramHelper.EscapeMarkdown(line.LineName);
 
-    private async Task NotifyFareChangeAsync(JsonElement? root)
-    {
-        if (root == null) return;
-        var r = root.Value;
-        
-        // Extract meaningful info to show user
-        // We will look for "groups" -> "routes" -> "tariffs"
-        var sb = new System.Text.StringBuilder();
-        sb.AppendLine("💰 *Ulaşım Ücret Tarifesinde Değişiklik*");
+        sb.AppendLine($"💰 *Ücret Değişikliği: {escapedLineNum} - {escapedLineName}*");
         sb.AppendLine();
 
-        if (r.TryGetProperty("groups", out var groups) && groups.ValueKind == JsonValueKind.Array)
+        // Show old vs new comparison
+        if (oldFare != null)
         {
-            foreach (var group in groups.EnumerateArray())
-            {
-                var groupName = group.GetProperty("name").GetString();
-                sb.AppendLine($"📍 *{groupName}*");
+            if (oldFare.FullFare != newFare.FullFare)
+                sb.AppendLine($"🔸 Tam: ~{oldFare.FullFare:F2} TL~ → *{newFare.FullFare:F2} TL*");
+            else
+                sb.AppendLine($"🔹 Tam: {newFare.FullFare:F2} TL");
 
-                if (group.TryGetProperty("routes", out var routes))
-                {
-                    foreach (var route in routes.EnumerateArray())
-                    {
-                        var routeName = route.GetProperty("routeName").GetString();
-                        var baseFare = route.GetProperty("baseFare").GetDecimal();
-                        
-                        sb.AppendLine($"   🔹 {routeName}: ~{baseFare} TL~");
+            if (oldFare.StudentFare != newFare.StudentFare)
+                sb.AppendLine($"🔸 Öğrenci: ~{oldFare.StudentFare:F2} TL~ → *{newFare.StudentFare:F2} TL*");
+            else if (newFare.StudentFare > 0)
+                sb.AppendLine($"🔹 Öğrenci: {newFare.StudentFare:F2} TL");
 
-                        if (route.TryGetProperty("tariffs", out var tariffs))
-                        {
-                            foreach (var tariff in tariffs.EnumerateArray())
-                            {
-                                // We need "tariffList" from root to map IDs if needed, 
-                                // but actually tariffs array has details? No, it has finalFare.
-                                // The tariffList at root has names (Tam, Ogrenci).
-                                var finalFare = tariff.GetProperty("finalFare").GetDecimal();
-                                var typeId = tariff.GetProperty("lineFareTypeId").GetInt32();
-                                var typeName = GetTariffName(r, typeId);
-
-                                sb.AppendLine($"      🔸 {typeName}: *{finalFare} TL*");
-                            }
-                        }
-                        sb.AppendLine();
-                    }
-                }
-            }
+            if (oldFare.DiscountedFare != newFare.DiscountedFare)
+                sb.AppendLine($"🔸 İndirimli: ~{oldFare.DiscountedFare:F2} TL~ → *{newFare.DiscountedFare:F2} TL*");
+            else if (newFare.DiscountedFare > 0)
+                sb.AppendLine($"🔹 İndirimli: {newFare.DiscountedFare:F2} TL");
         }
-        
-        sb.AppendLine("ℹ️ _Fiyatlar örnek hat (A1) baz alınarak tespit edilmiştir. Tüm hatlarda benzer artış olabilir._");
-        
+        else
+        {
+            // First time seeing this line's fare (after seed)
+            sb.AppendLine($"🔹 Tam: *{newFare.FullFare:F2} TL*");
+            if (newFare.StudentFare > 0) sb.AppendLine($"🔹 Öğrenci: *{newFare.StudentFare:F2} TL*");
+            if (newFare.DiscountedFare > 0) sb.AppendLine($"🔹 İndirimli: *{newFare.DiscountedFare:F2} TL*");
+        }
+
         await _telegramHelper.SendMessageAsync(sb.ToString());
+
+        try
+        {
+            var embed = DiscordEmbedBuilder.FareChanged(
+                line.LineNumber, line.LineName,
+                oldFare?.FullFare ?? 0, newFare.FullFare,
+                oldFare?.StudentFare ?? 0, newFare.StudentFare,
+                oldFare?.DiscountedFare ?? 0, newFare.DiscountedFare);
+            
+            var embedUrl = "https://ulasim.sakarya.bel.tr/ulasim/ucret-tarifeleri";
+            await _discordHelper.SendEmbedWithButtonAsync("SAKUS", "sakarya-ulasim", embed, "💰 Ücret Tarifeleri", embedUrl);
+        }
+        catch (Exception ex) { _logger.LogWarning("[Discord] Gönderilemedi: {Ex}", ex.Message); }
     }
 
     private string GetTariffName(JsonElement root, int typeId)
     {
-        // "tariffList":[{"lineFareTypeId":38,"typeName":"Tam"...}]
         if (root.TryGetProperty("tariffList", out var list) && list.ValueKind == JsonValueKind.Array)
         {
             foreach (var item in list.EnumerateArray())

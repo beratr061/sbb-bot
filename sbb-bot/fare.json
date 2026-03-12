@@ -1,0 +1,77 @@
+{
+  "lineId": 137,
+  "lineName": "AKYAZI - BOZTEPE",
+  "lineNumber": "A1",
+  "lineTypeId": 5732,
+  "slug": "a1-akyazi-boztepe-137",
+  "title": "AKYAZI - BOZTEPE",
+  "ekentLineIntegrationId": null,
+  "startDate": "2025-12-30T21:00:00Z",
+  "endDate": null,
+  "groups": [
+    {
+      "id": 472,
+      "name": "AKYAZI",
+      "order": 1,
+      "routes": [
+        {
+          "routeName": "\u0130ND\u0130 - B\u0130ND\u0130",
+          "tariffNumber": null,
+          "distance": null,
+          "baseFare": 29.25,
+          "order": 1,
+          "tariffs": [
+            {
+              "id": 5026,
+              "finalFare": 25.5,
+              "lineFareTypeId": 39
+            },
+            {
+              "id": 5027,
+              "finalFare": 29.25,
+              "lineFareTypeId": 38
+            }
+          ]
+        },
+        {
+          "routeName": "BOZTEPE",
+          "tariffNumber": null,
+          "distance": null,
+          "baseFare": 83.25,
+          "order": 2,
+          "tariffs": [
+            {
+              "id": 5028,
+              "finalFare": 65.0,
+              "lineFareTypeId": 39
+            },
+            {
+              "id": 5029,
+              "finalFare": 83.25,
+              "lineFareTypeId": 38
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "tariffList": [
+    {
+      "lineFareTypeId": 38,
+      "typeName": "Tam",
+      "typeId": 5405,
+      "percentage": 0,
+      "calculatedFare": 0
+    },
+    {
+      "lineFareTypeId": 39,
+      "typeName": "\u00d6\u011frenci",
+      "typeId": 5406,
+      "percentage": 0,
+      "calculatedFare": 0
+    }
+  ],
+  "isGroupColumnVisible": false,
+  "hasMultipleRoute": true,
+  "hasMultipleTariffNum": false
+}

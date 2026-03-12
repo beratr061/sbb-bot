@@ -2,6 +2,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SbbBot.Helpers;
+using SbbBot.Repositories;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -10,28 +11,32 @@ namespace SbbBot.Services;
 public class OpenDataWatcherService : BackgroundService
 {
     private const string ApiUrl = "https://veri.sakarya.bel.tr/api/3/action/group_activity_list?id=ulasim";
-    private const string StateFile = "Data/opendata_state.txt";
 
     private readonly ILogger<OpenDataWatcherService> _logger;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly TelegramHelper _telegramHelper;
-    private readonly TimeSpan _checkInterval = TimeSpan.FromHours(4); // Check every 4 hours
+    private readonly IDiscordHelper _discordHelper;
+    private readonly HashRepository _repository;
+    private readonly TimeSpan _checkInterval = TimeSpan.FromHours(4);
 
     public OpenDataWatcherService(
         ILogger<OpenDataWatcherService> logger,
         IHttpClientFactory httpClientFactory,
-        TelegramHelper telegramHelper)
+        TelegramHelper telegramHelper,
+        IDiscordHelper discordHelper,
+        HashRepository repository)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _telegramHelper = telegramHelper;
+        _discordHelper = discordHelper;
+        _repository = repository;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("OpenDataWatcherService started.");
         
-        // Initial delay
         await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
 
         using var timer = new PeriodicTimer(_checkInterval);
@@ -50,15 +55,7 @@ public class OpenDataWatcherService : BackgroundService
 
     private async Task CheckOpenDataAsync(CancellationToken token)
     {
-        var ageHours = StorageHelper.GetDataFileAgeHours("opendata_state.txt");
-        if (ageHours < _checkInterval.TotalHours)
-        {
-            _logger.LogInformation("Open data is fresh ({0:F1}h old), skipping check.", ageHours);
-            return;
-        }
-
         var client = _httpClientFactory.CreateClient();
-        // CKAN API typically returns JSON
         var response = await client.GetAsync(ApiUrl, token);
         if (!response.IsSuccessStatusCode) return;
 
@@ -67,28 +64,34 @@ public class OpenDataWatcherService : BackgroundService
 
         if (result == null || result.Success == false || result.Result == null) return;
 
-        // Get the most recent activity
-        var latestActivity = result.Result.OrderByDescending(x => x.Timestamp).FirstOrDefault();
-        if (latestActivity == null) return;
+        bool isFirstLoad = !await _repository.IsSeededAsync("open_data_sets");
+        
+        // Sort ascending so oldest new activity is processed first
+        var activities = result.Result.OrderBy(x => x.Timestamp).ToList();
 
-        var storedLastId = await StorageHelper.ReadStateAsync(StateFile);
-
-        if (storedLastId != latestActivity.Id)
+        foreach (var act in activities)
         {
-            // Only notify if we have a previous state (to avoid spam on first run)
-            // But actually for this low frequency, notifying on first run might be okay?
-            // Let's assume on first run we just save state to establish baseline.
-            
-            if (!string.IsNullOrEmpty(storedLastId))
-            {
-                await SendNotificationAsync(latestActivity);
-            }
+            string id = act.ObjectId ?? act.Id;
+            string title = act.Data?.Package?.Title ?? "Bilinmeyen Veri Seti";
 
-            await StorageHelper.SaveStateAsync(StateFile, latestActivity.Id);
+            bool exists = await _repository.ExistsAsync("open_data_sets", id);
+
+            if (!exists)
+            {
+                await _repository.InsertAsync("open_data_sets", id, title, "", act.Timestamp);
+
+                if (!isFirstLoad)
+                {
+                    await SendNotificationAsync(act);
+                }
+            }
         }
 
-        // Mark as checked (touch file even if no change)
-        StorageHelper.TouchDataFile("opendata_state.txt");
+        if (isFirstLoad)
+        {
+            await _repository.MarkAsSeededAsync("open_data_sets");
+            _logger.LogInformation("[{Servis}] İlk yükleme tamamlandı, bildirim atlanıyor.", nameof(OpenDataWatcherService));
+        }
     }
 
     private async Task SendNotificationAsync(OpenDataActivity activity)
@@ -102,12 +105,22 @@ public class OpenDataWatcherService : BackgroundService
             _ => "📢 Veri Portalı Aktivitesi"
         };
 
+        var datasetUrl = $"https://veri.sakarya.bel.tr/dataset/{activity.ObjectId}";
+
         var msg = $"{type}\n\n" +
                   $"📂 *{title}*\n" +
                   $"📅 {activity.Timestamp:dd.MM.yyyy HH:mm}\n\n" +
-                  $"🔗 [Detaylar](https://veri.sakarya.bel.tr/dataset/{activity.ObjectId})";
+                  $"🔗 [Detaylar]({datasetUrl})";
 
         await _telegramHelper.SendMessageAsync(msg);
+
+        try
+        {
+            bool isNew = activity.ActivityType == "new package";
+            var embed = DiscordEmbedBuilder.OpenDataUpdated(title, datasetUrl, isNew);
+            await _discordHelper.SendEmbedWithButtonAsync("BasinDairesi", "acik-veri-portali", embed, "📊 Veri Setine Git", datasetUrl);
+        }
+        catch (Exception ex) { _logger.LogWarning("[Discord] Gönderilemedi: {Ex}", ex.Message); }
     }
 }
 

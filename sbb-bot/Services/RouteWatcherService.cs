@@ -1,3 +1,4 @@
+using Dapper;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -14,8 +15,11 @@ public class RouteWatcherService : BackgroundService
     private readonly ILogger<RouteWatcherService> _logger;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly TelegramHelper _telegramHelper;
+    private readonly IDiscordHelper _discordHelper;
     private readonly BotConfig _config;
     private readonly AsyncRetryPolicy _retryPolicy;
+    private readonly SbbBot.Repositories.RouteRepository _repository;
+    private readonly IDbConnectionFactory _dbFactory;
 
     private const string ListApiUrl = "https://sbbpublicapi.sakarya.bel.tr/api/v1/Ulasim?busType={0}";
     private const string RouteApiUrl = "https://sbbpublicapi.sakarya.bel.tr/api/v1/Ulasim/route-and-busstops/{0}?date={1}";
@@ -30,12 +34,18 @@ public class RouteWatcherService : BackgroundService
         ILogger<RouteWatcherService> logger,
         IHttpClientFactory httpClientFactory,
         TelegramHelper telegramHelper,
-        IOptions<BotConfig> config)
+        IDiscordHelper discordHelper,
+        IOptions<BotConfig> config,
+        SbbBot.Repositories.RouteRepository repository,
+        IDbConnectionFactory dbFactory)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _telegramHelper = telegramHelper;
+        _discordHelper = discordHelper;
         _config = config.Value;
+        _repository = repository;
+        _dbFactory = dbFactory;
 
         _retryPolicy = Policy
             .Handle<Exception>()
@@ -68,16 +78,6 @@ public class RouteWatcherService : BackgroundService
 
     private async Task CheckRoutesAsync(CancellationToken cancellationToken)
     {
-        // Skip if the last full check was done recently
-        int intervalMinutes = _config.Intervals.RouteMinutes > 0 ? _config.Intervals.RouteMinutes : 1440;
-        var ageMinutes = StorageHelper.GetDataFileAgeMinutes("route_last_check.txt");
-        if (ageMinutes < intervalMinutes)
-        {
-            _logger.LogInformation("Route data is fresh ({0:F0}m old), skipping check.", ageMinutes);
-            return;
-        }
-
-        // 1. Get all active line IDs
         var allLines = new HashSet<int>();
         var belediyeIds = await FetchLineIdsAsync(BusTypeBelediye, cancellationToken);
         var ozelIds = await FetchLineIdsAsync(BusTypeOzelHalk, cancellationToken);
@@ -90,63 +90,110 @@ public class RouteWatcherService : BackgroundService
         foreach (var id in minibusIds) allLines.Add(id);
 
         _logger.LogInformation($"Checking routes for {allLines.Count} lines...");
+        bool isFirstLoad = !await _repository.IsSeededAsync();
 
-        // 2. Iterate and check each
         foreach (var lineId in allLines)
         {
             if (cancellationToken.IsCancellationRequested) break;
 
-            await ProcessLineRouteAsync(lineId, cancellationToken);
+            await ProcessLineRouteAsync(lineId, isFirstLoad, cancellationToken);
             
-            // Be gentle with the API
             await Task.Delay(1000, cancellationToken);
         }
 
-        // Mark as checked
-        await File.WriteAllTextAsync(Path.Combine(StorageHelper.GetDataPath(), "route_last_check.txt"), DateTime.UtcNow.ToString("o"));
+        if (isFirstLoad)
+        {
+            await _repository.MarkAsSeededAsync();
+            _logger.LogInformation("[{Servis}] İlk yükleme tamamlandı, bildirim atlanıyor.", nameof(RouteWatcherService));
+        }
     }
 
-    private async Task ProcessLineRouteAsync(int lineId, CancellationToken token)
+    private async Task ProcessLineRouteAsync(int lineId, bool isFirstLoad, CancellationToken token)
     {
-        var storedRoute = await StorageHelper.ReadRouteDataAsync(lineId.ToString());
-
-        // Skip if data was checked recently (within the configured interval)
-        if (storedRoute != null)
-        {
-            var minutesSinceLastCheck = (DateTime.UtcNow - storedRoute.LastChecked).TotalMinutes;
-            int intervalMinutes = _config.Intervals.RouteMinutes > 0 ? _config.Intervals.RouteMinutes : 1440;
-            if (minutesSinceLastCheck < intervalMinutes)
-            {
-                return;
-            }
-        }
-
         var currentRoute = await FetchRouteDetailsAsync(lineId, token);
         if (currentRoute == null) return;
 
         currentRoute.LastChecked = DateTime.UtcNow;
 
+        RouteResponse? storedRoute = null;
+        var rawJson = await _repository.GetRawJsonAsync(lineId.ToString(), "ALL");
+        if (!string.IsNullOrEmpty(rawJson))
+        {
+            storedRoute = JsonSerializer.Deserialize<RouteResponse>(rawJson);
+        }
+
+        var newJson = JsonSerializer.Serialize(currentRoute);
+
         if (storedRoute == null)
         {
-            // First run for this line, just save
-            await StorageHelper.SaveRouteDataAsync(currentRoute);
+            // Compute a simple hash based on JSON content
+            var newHash = System.Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(newJson)));
+            await _repository.UpsertAsync(lineId.ToString(), "ALL", newHash, newJson);
             return;
         }
 
-        // Compare
         var changes = CompareRoutes(storedRoute, currentRoute);
         if (changes.Count > 0)
         {
-            await NotifyChangesAsync(currentRoute, changes);
+            if (!isFirstLoad)
+            {
+                await NotifyChangesAsync(currentRoute, changes);
+            }
+            // Update even if no changes visually but LastChecked might be updated...
+            // Wait, we only want to update if there are changes.
         }
-        // Always update LastChecked even if no changes
-        await StorageHelper.SaveRouteDataAsync(currentRoute);
+
+        // We update the DB if there are changes, or just to keep LastChecked updated?
+        // Let's always update DB so rawJson matches current state and LastChecked.
+        var finalHash = System.Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(newJson)));
+        await _repository.UpsertAsync(lineId.ToString(), "ALL", finalHash, newJson);
+        await SaveBusStopsAsync(currentRoute);
+    }
+
+    /// <summary>
+    /// Saves bus stop data from a RouteResponse into the bus_stops table.
+    /// </summary>
+    private async Task SaveBusStopsAsync(RouteResponse routeData)
+    {
+        try
+        {
+            using var conn = _dbFactory.CreateConnection();
+            
+            var stopSql = @"
+                INSERT INTO bus_stops (line_number, direction, stop_order, stop_name, updated_at)
+                VALUES (@LineNumber, @Direction, @Order, @StopName, NOW())";
+
+            foreach (var r in routeData.Routes)
+            {
+                var dir = r.RouteName;
+                
+                // Delete old stops for this route direction, then re-insert
+                await conn.ExecuteAsync(
+                    "DELETE FROM bus_stops WHERE line_number = @LineNumber AND direction = @Direction",
+                    new { LineNumber = routeData.LineNumber, Direction = dir });
+                
+                foreach (var stop in r.BusStops)
+                {
+                    await conn.ExecuteAsync(stopSql, new
+                    {
+                        LineNumber = routeData.LineNumber,
+                        Direction = dir,
+                        Order = stop.Order,
+                        StopName = stop.Name
+                    });
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error saving bus stops for line {LineNumber}", routeData.LineNumber);
+        }
     }
 
     private async Task NotifyChangesAsync(RouteResponse route, List<string> changes)
     {
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"🔄 *Güzergah Değişikliği: {route.LineNumber} - {route.LineName}*");
+        sb.AppendLine($"🔄 *Güzergah Değişikliği: {TelegramHelper.EscapeMarkdown(route.LineNumber)} - {TelegramHelper.EscapeMarkdown(route.LineName)}*");
         sb.AppendLine();
         
         foreach (var change in changes)
@@ -155,9 +202,19 @@ public class RouteWatcherService : BackgroundService
         }
 
         sb.AppendLine(); 
-        sb.AppendLine($"[Detaylı Bilgi](https://ulasim.sakarya.bel.tr/ulasim/hat-detay/{route.LineId})");
+        var url = $"https://ulasim.sakarya.bel.tr/ulasim/hat-detay/{route.LineId}";
+        sb.AppendLine($"[Detaylı Bilgi]({url})");
 
         await _telegramHelper.SendMessageAsync(sb.ToString());
+
+        try
+        {
+            var addedStops = changes.Where(c => c.Contains("Durak Eklendi")).Select(c => c.Trim()).ToList();
+            var removedStops = changes.Where(c => c.Contains("Durak Kaldırıldı")).Select(c => c.Trim()).ToList();
+            var embed = DiscordEmbedBuilder.RouteChanged(route.LineNumber, route.LineName, addedStops, removedStops);
+            await _discordHelper.SendEmbedWithButtonAsync("SAKUS", "sakarya-ulasim", embed, "📍 Güzergahı Gör", url);
+        }
+        catch (Exception ex) { _logger.LogWarning("[Discord] Gönderilemedi: {Ex}", ex.Message); }
     }
 
     private List<string> CompareRoutes(RouteResponse oldData, RouteResponse newData)
@@ -243,14 +300,14 @@ public class RouteWatcherService : BackgroundService
             var client = _httpClientFactory.CreateClient();
             var url = string.Format(ListApiUrl, busType);
             
-            // Required headers
-            var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.Add("Origin", "https://ulasim.sakarya.bel.tr");
-            request.Headers.Add("Referer", "https://ulasim.sakarya.bel.tr");
-            request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-
-            var response = await _retryPolicy.ExecuteAsync(async () => 
-                await client.SendAsync(request, token));
+            var response = await _retryPolicy.ExecuteAsync(async () =>
+            {
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.Add("Origin", "https://ulasim.sakarya.bel.tr");
+                request.Headers.Add("Referer", "https://ulasim.sakarya.bel.tr");
+                request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+                return await client.SendAsync(request, token);
+            });
 
             if (!response.IsSuccessStatusCode) return new List<int>();
 
@@ -287,14 +344,15 @@ public class RouteWatcherService : BackgroundService
             // API format: yyyy-MM-ddT00:00:00.000Z
             var dateStr = DateTime.UtcNow.ToString("yyyy-MM-dd") + "T00:00:00.000Z";
             var url = string.Format(RouteApiUrl, lineId, dateStr);
-
-            var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.Add("Origin", "https://ulasim.sakarya.bel.tr");
-            request.Headers.Add("Referer", "https://ulasim.sakarya.bel.tr");
-            request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-
-            var response = await _retryPolicy.ExecuteAsync(async () => 
-                await client.SendAsync(request, token));
+            
+            var response = await _retryPolicy.ExecuteAsync(async () =>
+            {
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.Add("Origin", "https://ulasim.sakarya.bel.tr");
+                request.Headers.Add("Referer", "https://ulasim.sakarya.bel.tr");
+                request.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+                return await client.SendAsync(request, token);
+            });
 
             if (!response.IsSuccessStatusCode) return null;
 

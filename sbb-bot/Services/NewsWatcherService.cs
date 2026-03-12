@@ -4,10 +4,10 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Polly;
 using Polly.Retry;
-using System.Net.Http;
-using Microsoft.Extensions.Http;
-using SbbBot;
 using SbbBot.Helpers;
+using SbbBot.Repositories;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace SbbBot.Services;
@@ -17,8 +17,11 @@ public class NewsWatcherService : BackgroundService
     private readonly ILogger<NewsWatcherService> _logger;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly TelegramHelper _telegramHelper;
+    private readonly IDiscordHelper _discordHelper;
     private readonly BotConfig _config;
     private readonly AsyncRetryPolicy _retryPolicy;
+    private readonly HashRepository _repository;
+    
     // Updated News URL as ulasim.sakarya.bel.tr/duyurular is 404
     private const string NewsUrl = "https://sakarya.bel.tr/tr/Haberler/1";
 
@@ -26,12 +29,16 @@ public class NewsWatcherService : BackgroundService
         ILogger<NewsWatcherService> logger,
         IHttpClientFactory httpClientFactory,
         TelegramHelper telegramHelper,
-        IOptions<BotConfig> config)
+        IDiscordHelper discordHelper,
+        IOptions<BotConfig> config,
+        HashRepository repository)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _telegramHelper = telegramHelper;
+        _discordHelper = discordHelper;
         _config = config.Value;
+        _repository = repository;
 
         _retryPolicy = Policy
             .Handle<Exception>()
@@ -46,7 +53,8 @@ public class NewsWatcherService : BackgroundService
     {
         _logger.LogInformation("NewsWatcherService started.");
 
-        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(_config.Intervals.NewsMinutes));
+        int intervalMinutes = _config.Intervals.NewsMinutes > 0 ? _config.Intervals.NewsMinutes : 60;
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(intervalMinutes));
 
         do
         {
@@ -63,20 +71,10 @@ public class NewsWatcherService : BackgroundService
 
     private async Task CheckForNewsAsync(CancellationToken cancellationToken)
     {
-        int intervalMinutes = _config.Intervals.NewsMinutes > 0 ? _config.Intervals.NewsMinutes : 60;
-        var ageMinutes = StorageHelper.GetDataFileAgeMinutes("news.json");
-        if (ageMinutes < intervalMinutes)
-        {
-            _logger.LogInformation("News data is fresh ({0:F0}m old), skipping check.", ageMinutes);
-            return;
-        }
-
         var newsList = await FetchLatestNewsAsync(cancellationToken);
         if (newsList == null || newsList.Count == 0) return;
 
-        var storedNews = await StorageHelper.ReadNewsHistoryAsync();
-        var newNewsItems = new List<string>();
-        bool isFirstRun = storedNews.Count == 0;
+        bool isFirstLoad = !await _repository.IsSeededAsync("news");
 
         foreach (var newsItem in newsList)
         {
@@ -84,39 +82,43 @@ public class NewsWatcherService : BackgroundService
             var parts = newsItem.Split('|');
             if (parts.Length < 2) continue;
             
+            var title = parts[0];
             var link = parts[1];
 
-            if (!storedNews.Contains(link))
+            var hash = ComputeHash(link);
+            bool exists = await _repository.ExistsAsync("news", hash);
+
+            if (!exists)
             {
-                newNewsItems.Add(newsItem);
-                storedNews.Add(link);
+                await _repository.InsertAsync("news", hash, title, link, DateTime.UtcNow);
+
+                if (!isFirstLoad)
+                {
+                    _logger.LogInformation($"New transport news detected: {title}");
+                    await _telegramHelper.SendMessageAsync($"📢 *Yeni Ulaşım Haberi*\n\n📰 {TelegramHelper.EscapeMarkdown(title)}\n🔗 [Haberi Oku]({link})");
+
+                    try
+                    {
+                        var embed = DiscordEmbedBuilder.NewsPublished(title, link, DateTime.UtcNow);
+                        await _discordHelper.SendEmbedWithButtonAsync("BasinDairesi", "haberler", embed, "📰 Habere Git", link);
+                    }
+                    catch (Exception ex) { _logger.LogWarning("[Discord] Gönderilemedi: {Ex}", ex.Message); }
+                }
             }
         }
 
-        if (newNewsItems.Count > 0)
+        if (isFirstLoad)
         {
-             await StorageHelper.SaveNewsHistoryAsync(storedNews);
-
-             if (!isFirstRun)
-             {
-                 foreach (var item in newNewsItems)
-                 {
-                     var parts = item.Split('|');
-                     var title = parts[0];
-                     var link = parts[1];
-                     
-                     _logger.LogInformation($"New transport news detected: {title}");
-                     await _telegramHelper.SendMessageAsync($"📢 *Yeni Ulaşım Haberi*\n\n📰 {title}\n🔗 [Haberi Oku]({link})");
-                 }
-             }
-             else
-             {
-                 _logger.LogInformation($"Initial news fetch complete. found {newNewsItems.Count} relevant news items.");
-             }
+            await _repository.MarkAsSeededAsync("news");
+            _logger.LogInformation("[{Servis}] İlk yükleme tamamlandı, bildirim atlanıyor.", nameof(NewsWatcherService));
         }
+    }
 
-        // Mark as checked (touch file even if no new data)
-        StorageHelper.TouchDataFile("news.json");
+    private static string ComputeHash(string input)
+    {
+        using var sha = SHA256.Create();
+        var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(input));
+        return Convert.ToBase64String(bytes);
     }
 
     private async Task<List<string>> FetchLatestNewsAsync(CancellationToken cancellationToken)

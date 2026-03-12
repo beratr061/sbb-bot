@@ -4,10 +4,10 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Polly;
 using Polly.Retry;
-using System.Net.Http;
-using Microsoft.Extensions.Http;
-using SbbBot;
 using SbbBot.Helpers;
+using SbbBot.Repositories;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace SbbBot.Services;
@@ -17,8 +17,10 @@ public class UkomeWatcherService : BackgroundService
     private readonly ILogger<UkomeWatcherService> _logger;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly TelegramHelper _telegramHelper;
+    private readonly IDiscordHelper _discordHelper;
     private readonly BotConfig _config;
     private readonly AsyncRetryPolicy _retryPolicy;
+    private readonly HashRepository _repository;
 
     private const string MainUrl = "https://sakarya.bel.tr/tr/Anasayfa/UkomeKararlari";
     private const string BaseUrl = "https://sakarya.bel.tr";
@@ -27,12 +29,16 @@ public class UkomeWatcherService : BackgroundService
         ILogger<UkomeWatcherService> logger,
         IHttpClientFactory httpClientFactory,
         TelegramHelper telegramHelper,
-        IOptions<BotConfig> config)
+        IDiscordHelper discordHelper,
+        IOptions<BotConfig> config,
+        HashRepository repository)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _telegramHelper = telegramHelper;
+        _discordHelper = discordHelper;
         _config = config.Value;
+        _repository = repository;
 
         _retryPolicy = Policy
             .Handle<Exception>()
@@ -47,7 +53,8 @@ public class UkomeWatcherService : BackgroundService
     {
         _logger.LogInformation("UkomeWatcherService started.");
 
-        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(_config.Intervals.UkomeMinutes));
+        int intervalMinutes = _config.Intervals.UkomeMinutes > 0 ? _config.Intervals.UkomeMinutes : 1440;
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(intervalMinutes));
 
         do
         {
@@ -64,17 +71,8 @@ public class UkomeWatcherService : BackgroundService
 
     private async Task CheckForUkomeDecisionsAsync(CancellationToken cancellationToken)
     {
-        int intervalMinutes = _config.Intervals.UkomeMinutes > 0 ? _config.Intervals.UkomeMinutes : 1440;
-        var ageMinutes = StorageHelper.GetDataFileAgeMinutes("ukome.json");
-        if (ageMinutes < intervalMinutes)
-        {
-            _logger.LogInformation("UKOME data is fresh ({0:F0}m old), skipping check.", ageMinutes);
-            return;
-        }
-
         var client = _httpClientFactory.CreateClient();
         
-        // 1. Fetch Main Page to find ALL Year links
         string mainHtml = await _retryPolicy.ExecuteAsync(async () =>
             await client.GetStringAsync(MainUrl, cancellationToken));
 
@@ -88,14 +86,9 @@ public class UkomeWatcherService : BackgroundService
         {
             foreach (var node in yearNodes)
             {
-                // Check if link points to a UKOME year page
                 var href = node.GetAttributeValue("href", "");
-                var text = node.InnerText; // Raw inner text
+                var text = node.InnerText;
                 var alt = node.SelectSingleNode(".//img")?.GetAttributeValue("alt", "");
-
-                // Robust check strategies:
-                // 1. URL pattern: /tr/Sayfa/UKOME-Kararlari-YYYY
-                // 2. Text/Alt contains "Yılı UKOME Kararları"
                 
                 bool isUkomeLink = (!string.IsNullOrWhiteSpace(href) && href.Contains("UKOME-Kararlari-")) ||
                                    (!string.IsNullOrWhiteSpace(text) && text.Contains("Yılı UKOME Kararları")) ||
@@ -114,22 +107,16 @@ public class UkomeWatcherService : BackgroundService
             return;
         }
 
-        var storedDecisions = await StorageHelper.ReadUkomeDecisionsAsync();
-        var storedYears = await StorageHelper.ReadUkomeYearsAsync();
-        
-        bool isFirstRun = storedDecisions.Count == 0;
-        var newDecisions = new List<string>(); 
-        var decisionDetails = new Dictionary<string, string>(); 
-        var newYearTitles = new List<string>();
+        bool isFirstLoad = !await _repository.IsSeededAsync("ukome_decisions");
+        int newDecisionsCount = 0;
+        var newDecisionsDetailed = new List<(string Url, string Title)>();
 
-        // Loop through each year
         foreach (var yearNode in validYearNodes)
         {
             string yearUrl = yearNode.GetAttributeValue("href", "");
             string yearTitle = yearNode.InnerText.Trim();
             if (string.IsNullOrWhiteSpace(yearTitle)) yearTitle = yearNode.SelectSingleNode(".//img")?.GetAttributeValue("alt", "") ?? "UKOME";
             
-            // Cleanup Title (remove newlines usually present with img)
             yearTitle = Regex.Replace(yearTitle, @"\s+", " ").Trim();
 
             if (string.IsNullOrWhiteSpace(yearUrl)) continue;
@@ -140,27 +127,14 @@ public class UkomeWatcherService : BackgroundService
                 else yearUrl = BaseUrl + "/" + yearUrl;
             }
 
-            // Check if this is a NEW year
-            if (!storedYears.Contains(yearUrl))
-            {
-                if (!isFirstRun)
-                {
-                    // New Year detected! (e.g. 2026 coming out)
-                    newYearTitles.Add(yearTitle);
-                }
-                storedYears.Add(yearUrl);
-            }
-
             try 
             {
-                // 2. Fetch the Year Page
                 string yearHtml = await _retryPolicy.ExecuteAsync(async () =>
                     await client.GetStringAsync(yearUrl, cancellationToken));
 
                 var doc = new HtmlDocument();
                 doc.LoadHtml(yearHtml);
 
-                // 3. Extract Decisions (PDF Links)
                 var pdfNodes = doc.DocumentNode.SelectNodes("//a[contains(@href, '.pdf')]");
 
                 if (pdfNodes != null)
@@ -172,23 +146,20 @@ public class UkomeWatcherService : BackgroundService
 
                         if (string.IsNullOrWhiteSpace(href)) continue;
                         
-                        // Ensure absolute URL (Unique Identifier)
                         if (!href.StartsWith("http"))
                         {
                            if (href.StartsWith("/")) href = BaseUrl + href;
                            else href = BaseUrl + "/" + href;
                         }
 
-                        // Filter: Must look like a UKOME decision or reside on this page.
-                        if (!storedDecisions.Contains(href))
+                        var hash = ComputeHash(href);
+                        bool exists = await _repository.ExistsAsync("ukome_decisions", hash);
+
+                        if (!exists)
                         {
-                            newDecisions.Add(href);
-                            storedDecisions.Add(href);
-                            
-                            if (!decisionDetails.ContainsKey(href))
-                            {
-                                decisionDetails[href] = $"{text} ({yearTitle})";
-                            }
+                            await _repository.InsertAsync("ukome_decisions", hash, $"{text} ({yearTitle})", href, DateTime.UtcNow);
+                            newDecisionsCount++;
+                            newDecisionsDetailed.Add((href, $"{text} ({yearTitle})"));
                         }
                     }
                 }
@@ -199,59 +170,52 @@ public class UkomeWatcherService : BackgroundService
             }
         }
 
-        // Save State
-        if (newDecisions.Count > 0)
+        if (!isFirstLoad)
         {
-            await StorageHelper.SaveUkomeDecisionsAsync(storedDecisions);
-        }
-        if (storedYears.Count > 0) // Should ideally optimize to save only if changed
-        {
-             await StorageHelper.SaveUkomeYearsAsync(storedYears);
-        }
-
-        // Notifications
-        if (!isFirstRun)
-        {
-            // 1. Notify about New Years
-            foreach (var title in newYearTitles)
+            if (newDecisionsCount > 0)
             {
-                 await _telegramHelper.SendMessageAsync($"📢 *Yeni UKOME Yılı Yayınlandı*\n\n📅 {title} dönemi kararları sisteme düşmeye başladı!");
-            }
-
-            // 2. Notify about New Decisions
-            if (newDecisions.Count > 0)
-            {
-                // If many decisions (batch update), send summary
-                if (newDecisions.Count > 3)
+                if (newDecisionsCount > 3)
                 {
-                     // Group by Year for summary? Or simple summary.
-                     // The user wants: "2026 Yılı UKOME Kararlarına Yeni Kararlar eklendi" 
-                     // We can infer the year from the decisions or just say generic.
-                     
-                     // Let's optimize: If we have multiple decisions, we can send a digest.
-                     await _telegramHelper.SendMessageAsync($"🚦 *UKOME Kararları Güncellendi*\n\nToplam {newDecisions.Count} adet yeni karar eklendi.\nDetaylar için web sitesini ziyaret edebilirsiniz.");
+                     await _telegramHelper.SendMessageAsync($"🚦 *UKOME Kararları Güncellendi*\n\nToplam {newDecisionsCount} adet yeni karar eklendi.\nDetaylar için web sitesini ziyaret edebilirsiniz.");
+
+                     foreach (var item in newDecisionsDetailed)
+                     {
+                         try
+                         {
+                             var embed = DiscordEmbedBuilder.UkomeDecision(item.Title, item.Url, DateTime.UtcNow);
+                             await _discordHelper.SendEmbedWithButtonAsync("BasinDairesi", "ukome-kararlari", embed, "📋 Karara Git", item.Url);
+                         }
+                         catch (Exception ex) { _logger.LogWarning("[Discord] Gönderilemedi: {Ex}", ex.Message); }
+                     }
                 }
                 else
                 {
-                    // Few decisions -> Send details
-                    foreach (var url in newDecisions)
+                    foreach (var item in newDecisionsDetailed)
                     {
-                        string info = decisionDetails.ContainsKey(url) ? decisionDetails[url] : "Yeni Karar";
-                        await _telegramHelper.SendMessageAsync($"🚦 *Yeni UKOME Kararı Eklendi*\n\n📄 {info}\n🔗 [PDF İndir]({url})");
+                        string info = string.IsNullOrWhiteSpace(item.Title) ? "Yeni Karar" : TelegramHelper.EscapeMarkdown(item.Title);
+                        await _telegramHelper.SendMessageAsync($"🚦 *Yeni UKOME Kararı Eklendi*\n\n📄 {info}\n🔗 [PDF İndir]({item.Url})");
+
+                        try
+                        {
+                            var embed = DiscordEmbedBuilder.UkomeDecision(item.Title, item.Url, DateTime.UtcNow);
+                            await _discordHelper.SendEmbedWithButtonAsync("BasinDairesi", "ukome-kararlari", embed, "📋 Karara Git", item.Url);
+                        }
+                        catch (Exception ex) { _logger.LogWarning("[Discord] Gönderilemedi: {Ex}", ex.Message); }
                     }
                 }
             }
         }
         else
         {
-             // First Run Summary
-             if (newDecisions.Count > 0)
-             {
-                 await _telegramHelper.SendMessageAsync($"🚦 *UKOME Kararları Arşivi Güncellendi*\n\nToplam {newDecisions.Count} adet karar veritabanına eklendi. Yeni yıllar ve kararlar eklendikçe bildirim gelecektir.");
-             }
+            await _repository.MarkAsSeededAsync("ukome_decisions");
+            _logger.LogInformation("[{Servis}] İlk yükleme tamamlandı, bildirim atlanıyor.", nameof(UkomeWatcherService));
         }
+    }
 
-        // Mark as checked (touch file even if no new data)
-        StorageHelper.TouchDataFile("ukome.json");
+    private static string ComputeHash(string input)
+    {
+        using var sha = SHA256.Create();
+        var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(input));
+        return Convert.ToBase64String(bytes);
     }
 }

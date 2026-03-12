@@ -4,10 +4,8 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Polly;
 using Polly.Retry;
-using System.Net.Http;
-using Microsoft.Extensions.Http;
-using SbbBot;
 using SbbBot.Helpers;
+using SbbBot.Repositories;
 
 namespace SbbBot.Services;
 
@@ -16,20 +14,27 @@ public class DocumentWatcherService : BackgroundService
     private readonly ILogger<DocumentWatcherService> _logger;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly TelegramHelper _telegramHelper;
+    private readonly IDiscordHelper _discordHelper;
     private readonly BotConfig _config;
     private readonly AsyncRetryPolicy _retryPolicy;
+    private readonly HashRepository _repository;
+    
     private const string DocumentsUrl = "https://www.sakarya.bel.tr/tr/StratejikPlanlama";
 
     public DocumentWatcherService(
         ILogger<DocumentWatcherService> logger,
         IHttpClientFactory httpClientFactory,
         TelegramHelper telegramHelper,
-        IOptions<BotConfig> config)
+        IDiscordHelper discordHelper,
+        IOptions<BotConfig> config,
+        HashRepository repository)
     {
         _logger = logger;
         _httpClientFactory = httpClientFactory;
         _telegramHelper = telegramHelper;
+        _discordHelper = discordHelper;
         _config = config.Value;
+        _repository = repository;
 
         _retryPolicy = Policy
             .Handle<Exception>()
@@ -44,7 +49,8 @@ public class DocumentWatcherService : BackgroundService
     {
         _logger.LogInformation("DocumentWatcherService started.");
 
-        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(_config.Intervals.DocumentsMinutes));
+        int intervalMinutes = _config.Intervals.DocumentsMinutes > 0 ? _config.Intervals.DocumentsMinutes : 1440;
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(intervalMinutes));
 
         do
         {
@@ -61,14 +67,6 @@ public class DocumentWatcherService : BackgroundService
 
     private async Task CheckForDocumentsAsync(CancellationToken cancellationToken)
     {
-        int intervalMinutes = _config.Intervals.DocumentsMinutes > 0 ? _config.Intervals.DocumentsMinutes : 1440;
-        var ageMinutes = StorageHelper.GetDataFileAgeMinutes("documents.json");
-        if (ageMinutes < intervalMinutes)
-        {
-            _logger.LogInformation("Documents data is fresh ({0:F0}m old), skipping check.", ageMinutes);
-            return;
-        }
-
         var client = _httpClientFactory.CreateClient();
 
         string html = await _retryPolicy.ExecuteAsync(async () =>
@@ -77,7 +75,6 @@ public class DocumentWatcherService : BackgroundService
         var doc = new HtmlDocument();
         doc.LoadHtml(html);
 
-        // Find all links ending with .pdf
         var pdfNodes = doc.DocumentNode.SelectNodes("//a[contains(@href, '.pdf')]");
         
         if (pdfNodes == null || pdfNodes.Count == 0)
@@ -86,9 +83,7 @@ public class DocumentWatcherService : BackgroundService
             return;
         }
 
-        var currentDocuments = new HashSet<string>();
-        var newDocuments = new List<(string Title, string Url)>();
-        var oldDocuments = await StorageHelper.ReadDocumentsAsync();
+        bool isFirstLoad = !await _repository.IsSeededAsync("documents");
 
         foreach (var node in pdfNodes)
         {
@@ -103,39 +98,40 @@ public class DocumentWatcherService : BackgroundService
                 href = new Uri(uri, href).ToString();
             }
             
-            // Use URL as unique key
-            currentDocuments.Add(href);
+            var hash = ComputeHash(href);
+            bool exists = await _repository.ExistsAsync("documents", hash);
 
-            if (!oldDocuments.Contains(href))
+            // Save to DB
+            if (!exists)
             {
-                newDocuments.Add((title, href));
+                await _repository.InsertAsync("documents", hash, string.IsNullOrEmpty(title) ? "Belge" : title, href, DateTime.UtcNow);
+                
+                if (!isFirstLoad)
+                {
+                    var message = $"📄 *Yeni Resmi Belge Eklendi!*\n\nDosya: {TelegramHelper.EscapeMarkdown(title)}\nLink: [İndir]({href})";
+                    await _telegramHelper.SendMessageAsync(message);
+
+                    try
+                    {
+                        var embed = DiscordEmbedBuilder.DocumentPublished(title, href, DateTime.UtcNow);
+                        await _discordHelper.SendEmbedWithButtonAsync("BasinDairesi", "butce-ve-stratejik-yonetim", embed, "📄 Dökümana Git", href);
+                    }
+                    catch (Exception ex) { _logger.LogWarning("[Discord] Gönderilemedi: {Ex}", ex.Message); }
+                }
             }
         }
 
-        if (newDocuments.Any())
+        if (isFirstLoad)
         {
-            _logger.LogInformation($"{newDocuments.Count} new documents detected.");
-            foreach (var docItem in newDocuments)
-            {
-                var message = $"📄 *Yeni Resmi Belge Eklendi!*\n\nDosya: {docItem.Title}\nLink: [İndir]({docItem.Url})";
-                await _telegramHelper.SendMessageAsync(message);
-            }
-            
-            // Update storage with ALL current documents found
-            // effectively initializing if it was empty, or updating if new ones added.
-            // We usually want to keep the union or just the current state.
-            // Requirement says "Yeni eklenen dosyalar".
-            // If we just save currentDocuments, we are good.
-            await StorageHelper.SaveDocumentsAsync(currentDocuments);
+            await _repository.MarkAsSeededAsync("documents");
+            _logger.LogInformation("[{Servis}] İlk yükleme tamamlandı, bildirim atlanıyor.", nameof(DocumentWatcherService));
         }
-        else if (currentDocuments.Count != oldDocuments.Count)
-        {
-             // If counts differ but no new documents, maybe some were removed.
-             // We update the list to reflect current state so we don't track deleted files forever.
-             await StorageHelper.SaveDocumentsAsync(currentDocuments);
-        }
+    }
 
-        // Mark as checked (touch file even if no new data)
-        StorageHelper.TouchDataFile("documents.json");
+    private static string ComputeHash(string input)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(input));
+        return Convert.ToBase64String(bytes);
     }
 }

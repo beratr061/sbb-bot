@@ -48,4 +48,18 @@ public class TelegramHelper
             );
         });
     }
+
+    /// <summary>
+    /// Escapes special Markdown characters in user-provided text to prevent Telegram API errors.
+    /// </summary>
+    public static string EscapeMarkdown(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        return text
+            .Replace("\\", "\\\\")
+            .Replace("*", "\\*")
+            .Replace("_", "\\_")
+            .Replace("`", "\\`")
+            .Replace("[", "\\[");
+    }
 }
