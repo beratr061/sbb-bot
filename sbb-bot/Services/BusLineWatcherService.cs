@@ -67,8 +67,8 @@ public class BusLineWatcherService : BackgroundService
     {
         _logger.LogInformation("BusLineWatcherService started.");
 
-        int intervalHours = _config.Intervals.BusLinesHours > 0 ? _config.Intervals.BusLinesHours : 24;
-        using var timer = new PeriodicTimer(TimeSpan.FromHours(intervalHours));
+        int intervalMinutes = _config.Intervals.BusLinesMinutes > 0 ? _config.Intervals.BusLinesMinutes : 360;
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(intervalMinutes));
 
         do
         {
@@ -215,8 +215,8 @@ public class BusLineWatcherService : BackgroundService
                 }
                 else
                 {
-                    var hoursSinceLastCheck = (DateTime.UtcNow - storedSchedule.LastChecked).TotalHours;
-                    if (hoursSinceLastCheck < _config.Intervals.BusLinesHours)
+                    var minutesSinceLastCheck = (DateTime.UtcNow - storedSchedule.LastChecked).TotalMinutes;
+                    if (minutesSinceLastCheck < _config.Intervals.BusLinesMinutes)
                     {
                         continue;
                     }

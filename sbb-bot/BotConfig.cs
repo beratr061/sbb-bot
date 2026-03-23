@@ -16,7 +16,7 @@ public class IntervalsConfig
 {
     public int NewsMinutes { get; set; }
     public int DocumentsMinutes { get; set; }
-    public int BusLinesHours { get; set; }
+    public int BusLinesMinutes { get; set; }
     public int MeetingMinutes { get; set; }
     public int AnnouncementMinutes { get; set; }
     public int UkomeMinutes { get; set; }
