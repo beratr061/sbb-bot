@@ -183,7 +183,8 @@ public class AnnouncementWatcherService : BackgroundService
 
             try
             {
-                var embed = DiscordEmbedBuilder.AnnouncementNew(title, content, startDate ?? DateTime.UtcNow, endDate ?? DateTime.UtcNow);
+                var discordContent = HtmlToDiscordMarkdown(content);
+                var embed = DiscordEmbedBuilder.AnnouncementNew(title, discordContent, startDate ?? DateTime.UtcNow, endDate ?? DateTime.UtcNow);
                 var buttonUrl = "https://ulasim.sakarya.bel.tr/duyurular";
                 await _discordHelper.SendEmbedWithButtonAsync("SAKUS", "sakarya-ulasim", embed, "📢 Tüm Duyurular", buttonUrl);
             }
@@ -206,12 +207,49 @@ public class AnnouncementWatcherService : BackgroundService
         return Convert.ToBase64String(bytes);
     }
 
+    /// <summary>
+    /// HTML içeriğini Discord markdown formatına dönüştürür.
+    /// Discord: bold = **, italic = *
+    /// </summary>
+    private static string HtmlToDiscordMarkdown(string html)
+    {
+        var text = Regex.Replace(html, @"<br\s*/?>", "\n", RegexOptions.IgnoreCase);
+        text = Regex.Replace(text, @"<strong>(.*?)</strong>", "**$1**",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        text = Regex.Replace(text, @"<em>(.*?)</em>", "*$1*",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        text = Regex.Replace(text, @"<p>(.*?)</p>", "$1\n",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        text = Regex.Replace(text, @"<[^>]+>", "");
+        text = System.Net.WebUtility.HtmlDecode(text);
+        text = Regex.Replace(text, @"\n{3,}", "\n\n").Trim();
+        return text;
+    }
+
     private static string HtmlToMarkdown(string html)
     {
         var text = Regex.Replace(html, @"<br\s*/?>", "\n", RegexOptions.IgnoreCase);
         text = Regex.Replace(text, @"<strong>(.*?)</strong>", "*$1*",
             RegexOptions.IgnoreCase | RegexOptions.Singleline);
         text = Regex.Replace(text, @"<em>(.*?)</em>", "_$1_",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        text = Regex.Replace(text, @"<p>(.*?)</p>", "$1\n",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        text = Regex.Replace(text, @"<[^>]+>", "");
+        text = System.Net.WebUtility.HtmlDecode(text);
+        text = Regex.Replace(text, @"\n{3,}", "\n\n").Trim();
+        return text;
+    }
+    /// <summary>
+    /// HTML içeriğini Discord markdown formatına dönüştürür.
+    /// Discord: bold = **, italic = *, Telegram'dan farklı.
+    /// </summary>
+    private static string HtmlToDiscordMarkdown(string html)
+    {
+        var text = Regex.Replace(html, @"<br\s*/?>", "\n", RegexOptions.IgnoreCase);
+        text = Regex.Replace(text, @"<strong>(.*?)</strong>", "**$1**",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        text = Regex.Replace(text, @"<em>(.*?)</em>", "*$1*",
             RegexOptions.IgnoreCase | RegexOptions.Singleline);
         text = Regex.Replace(text, @"<p>(.*?)</p>", "$1\n",
             RegexOptions.IgnoreCase | RegexOptions.Singleline);
