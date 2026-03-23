@@ -240,22 +240,4 @@ public class AnnouncementWatcherService : BackgroundService
         text = Regex.Replace(text, @"\n{3,}", "\n\n").Trim();
         return text;
     }
-    /// <summary>
-    /// HTML içeriğini Discord markdown formatına dönüştürür.
-    /// Discord: bold = **, italic = *, Telegram'dan farklı.
-    /// </summary>
-    private static string HtmlToDiscordMarkdown(string html)
-    {
-        var text = Regex.Replace(html, @"<br\s*/?>", "\n", RegexOptions.IgnoreCase);
-        text = Regex.Replace(text, @"<strong>(.*?)</strong>", "**$1**",
-            RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        text = Regex.Replace(text, @"<em>(.*?)</em>", "*$1*",
-            RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        text = Regex.Replace(text, @"<p>(.*?)</p>", "$1\n",
-            RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        text = Regex.Replace(text, @"<[^>]+>", "");
-        text = System.Net.WebUtility.HtmlDecode(text);
-        text = Regex.Replace(text, @"\n{3,}", "\n\n").Trim();
-        return text;
-    }
 }
